@@ -18,6 +18,7 @@ Rectangle {
     signal togglePreview()
     signal appearanceRequested()
     signal performanceRequested()
+    signal shortcutsRequested()
 
     implicitHeight: 48
     color: theme ? theme.surface : "#151820"
@@ -171,6 +172,10 @@ Rectangle {
             })
         }
         entries.push({ separator: true })
+        entries.push({
+            label: "Keyboard Shortcuts…",
+            action: function() { root.shortcutsRequested() }
+        })
         entries.push({
             label: "Appearance…",
             action: function() { root.appearanceRequested() }
@@ -360,7 +365,6 @@ Rectangle {
                     Layout.preferredWidth: 30
                     Layout.preferredHeight: 30
                     theme: root.theme
-                    backgroundless: true
                     label: ""
                     tooltip: "Toggle preview pane (Ctrl+P)"
                     active: backend ? backend.preview_visible : false

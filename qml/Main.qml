@@ -58,6 +58,8 @@ Window {
                                         || batchRenameDialog.open
                                         || appearanceDialog.open
                                         || performanceDialog.open
+                                        || keyboardShortcutsDialog.open
+                                        || transferManager.open
     readonly property bool typing: toolbar.editing
                                     || backend.renaming_path !== ""
                                     || quickLook.opened
@@ -107,7 +109,7 @@ Window {
         backend.save_window(width, height)
         backend.save_session()
         backend.flush_recent_history()
-        backend.pause_for_background(lifecycle.startup_behavior === "fast_reopen")
+        backend.pause_for_background()
         close.accepted = false
         visible = false
         lifecycle.window_closed()
@@ -195,6 +197,15 @@ Window {
     function closeSearch() {
         searchOpen = false
         toolbar.cancelSearch()
+    }
+
+    function hasActiveTransfer() {
+        var jobs = backend ? backend.transfer_jobs : []
+        for (var i = 0; i < jobs.length; i++) {
+            if (jobs[i].status === "running" || jobs[i].status === "queued")
+                return true
+        }
+        return false
     }
 
     function closeContextMenu() {
@@ -601,14 +612,26 @@ Window {
     }
     Shortcut {
         sequence: "Escape"
-        enabled: root.contextMenuRevision >= 0
-                 && (MenuManager.hasOpenMenu() || !root.typing)
+        enabled: keyboardShortcutsDialog.open || performanceDialog.open
+        || transferManager.open || appearanceDialog.open
+                 || (root.contextMenuRevision >= 0
+                     && (MenuManager.hasOpenMenu() || !root.typing))
         onActivated: {
-            if (root.closeContextMenu()) {
+            if (keyboardShortcutsDialog.open) {
+                keyboardShortcutsDialog.close()
+            } else if (performanceDialog.open) {
+                performanceDialog.close()
+            } else if (transferManager.open) {
+                transferManager.close()
+            } else if (appearanceDialog.open) {
+                appearanceDialog.close()
+            } else if (root.closeContextMenu()) {
                 return
             } else if (root.searchOpen) {
                 root.closeSearch()
             } else if (backend.op_active && backend.op_cancelable) {
+                backend.cancel_operation()
+            } else if (root.hasActiveTransfer()) {
                 backend.cancel_operation()
             } else if (fileArea.selectionCount > 0) {
                 fileArea.clearSelection()
@@ -622,7 +645,7 @@ Window {
     }
 
     Timer {
-        interval: 200
+        interval: 150
         repeat: true
         running: root.primaryWindow
         onTriggered: {
@@ -631,6 +654,16 @@ Window {
                 root.openLaunchedPath(requests[i])
             if (lifecycle.should_exit())
                 Qt.quit()
+        }
+    }
+
+    Timer {
+        interval: 600
+        repeat: true
+        running: root.visible
+        onTriggered: {
+            backend.refresh_transfer_jobs()
+            backend.refresh_clipboard_state()
         }
     }
 
@@ -737,6 +770,7 @@ Window {
                     onTogglePreview: backend.toggle_preview()
                     onAppearanceRequested: appearanceDialog.open = true
                     onPerformanceRequested: performanceDialog.open = true
+                    onShortcutsRequested: keyboardShortcutsDialog.open = true
                 }
 
                 Row {
@@ -832,6 +866,7 @@ Window {
     ProgressPanel {
         theme: theme
         backend: backend
+        manager: transferManager
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         anchors.rightMargin: 18
@@ -871,10 +906,21 @@ Window {
         theme: theme
     }
 
+    KeyboardShortcutsDialog {
+        id: keyboardShortcutsDialog
+        theme: theme
+    }
+
     PerformanceDialog {
         id: performanceDialog
         theme: theme
         lifecycle: lifecycle
+    }
+
+    TransferManager {
+        id: transferManager
+        theme: theme
+        backend: backend
     }
 
     TagPicker {

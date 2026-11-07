@@ -120,8 +120,12 @@ pub fn read_directory(
     Ok(entries)
 }
 
-pub fn read_directory_for_search(path: &Path, show_hidden: bool) -> Result<Vec<Entry>, String> {
-    read_directory_inner(path, show_hidden, None)
+pub fn visit_directory_for_search(
+    path: &Path,
+    show_hidden: bool,
+    visitor: impl FnMut(Entry) -> bool,
+) -> Result<(), String> {
+    visit_directory_inner(path, show_hidden, None, visitor)
 }
 
 fn read_directory_inner(
@@ -129,8 +133,21 @@ fn read_directory_inner(
     show_hidden: bool,
     icons: Option<&Arc<IconResolver>>,
 ) -> Result<Vec<Entry>, String> {
-    let read = fs::read_dir(path).map_err(|error| friendly_io_error(path, &error))?;
     let mut entries = Vec::new();
+    visit_directory_inner(path, show_hidden, icons, |entry| {
+        entries.push(entry);
+        true
+    })?;
+    Ok(entries)
+}
+
+fn visit_directory_inner(
+    path: &Path,
+    show_hidden: bool,
+    icons: Option<&Arc<IconResolver>>,
+    mut visitor: impl FnMut(Entry) -> bool,
+) -> Result<(), String> {
+    let read = fs::read_dir(path).map_err(|error| friendly_io_error(path, &error))?;
 
     for item in read {
         let Ok(item) = item else {
@@ -141,7 +158,8 @@ fn read_directory_inner(
         if name == "." || name == ".." {
             continue;
         }
-        if !show_hidden && name.starts_with('.') {
+        let is_hidden = name.starts_with('.');
+        if !show_hidden && is_hidden {
             continue;
         }
         let entry_path = path.join(&name);
@@ -182,12 +200,12 @@ fn read_directory_inner(
             .unwrap_or(0.0);
         use std::os::unix::fs::MetadataExt;
 
-        entries.push(Entry {
+        let entry = Entry {
             name,
             path: entry_path,
             is_dir,
             is_symlink,
-            is_hidden: item.file_name().to_string_lossy().starts_with('.'),
+            is_hidden,
             size: if is_dir { 0 } else { meta.len() },
             modified_ms,
             kind,
@@ -199,10 +217,13 @@ fn read_directory_inner(
             display_path: String::new(),
             tree_depth: 0,
             tree_expanded: false,
-        });
+        };
+        if !visitor(entry) {
+            break;
+        }
     }
 
-    Ok(entries)
+    Ok(())
 }
 
 pub fn read_recent_files(

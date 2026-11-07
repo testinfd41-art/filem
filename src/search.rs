@@ -10,8 +10,9 @@ use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::fs_entry::{read_directory_for_search, Entry};
+use crate::fs_entry::{visit_directory_for_search, Entry};
 use crate::icons::{icon_names_for, IconResolver};
 use crate::natsort::natural_cmp;
 use crate::tags::TagStore;
@@ -150,6 +151,11 @@ pub struct SearchQuery {
     pub types: Vec<TypeFilter>,
     pub min_size: Option<u64>,
     pub max_size: Option<u64>,
+    pub modified_after_ms: Option<i64>,
+    pub modified_before_ms: Option<i64>,
+    pub include_hidden: bool,
+    pub files_only: bool,
+    pub folders_only: bool,
 }
 
 pub fn parse_size(value: &str) -> Option<u64> {
@@ -211,6 +217,28 @@ impl SearchQuery {
                 }
                 continue;
             }
+            if let Some(value) = token.strip_prefix("modified:") {
+                let (after, before) = parse_modified_range(value);
+                if after.is_some() || before.is_some() {
+                    query.modified_after_ms = after;
+                    query.modified_before_ms = before;
+                }
+                continue;
+            }
+            if token == "hidden:true" || token == "hidden:include" {
+                query.include_hidden = true;
+                continue;
+            }
+            if token == "kind:files" || token == "kind:file" {
+                query.files_only = true;
+                query.folders_only = false;
+                continue;
+            }
+            if token == "kind:folders" || token == "kind:folder" {
+                query.folders_only = true;
+                query.files_only = false;
+                continue;
+            }
             if let Some(value) = token.strip_prefix("name:") {
                 if !value.is_empty() {
                     query.terms.push(value.to_lowercase());
@@ -229,6 +257,11 @@ impl SearchQuery {
             && self.types.is_empty()
             && self.min_size.is_none()
             && self.max_size.is_none()
+            && self.modified_after_ms.is_none()
+            && self.modified_before_ms.is_none()
+            && !self.include_hidden
+            && !self.files_only
+            && !self.folders_only
     }
 }
 
@@ -264,6 +297,13 @@ fn query_tokens(input: &str) -> Vec<String> {
 
 fn parse_size_range(value: &str) -> (Option<u64>, Option<u64>) {
     let value = value.trim();
+    match value {
+        "empty" => return (Some(0), Some(0)),
+        "small" => return (Some(1), Some(1024 * 1024)),
+        "medium" => return (Some(1024 * 1024 + 1), Some(100 * 1024 * 1024)),
+        "large" => return (Some(100 * 1024 * 1024 + 1), None),
+        _ => {}
+    }
     for (prefix, is_min) in [
         (">=", true),
         ("<=", false),
@@ -282,8 +322,174 @@ fn parse_size_range(value: &str) -> (Option<u64>, Option<u64>) {
     (parse_size(value), None)
 }
 
+fn local_day_start(days_ago: i32) -> Option<i64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as libc::time_t;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let local_ptr = unsafe { libc::localtime_r(&now, local.as_mut_ptr()) };
+    if local_ptr.is_null() {
+        return None;
+    }
+    let mut local = unsafe { local.assume_init() };
+    local.tm_mday -= days_ago;
+    local.tm_hour = 0;
+    local.tm_min = 0;
+    local.tm_sec = 0;
+    local.tm_isdst = -1;
+    let timestamp = unsafe { libc::mktime(&mut local) };
+    (timestamp != -1).then_some(timestamp as i64 * 1000)
+}
+
+fn parse_local_date(value: &str) -> Option<i64> {
+    let mut parts = value.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<i32>().ok()?;
+    let day = parts.next()?.parse::<i32>().ok()?;
+    if parts.next().is_some()
+        || !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+    {
+        return None;
+    }
+    let mut local = libc::tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: day,
+        tm_mon: month - 1,
+        tm_year: year - 1900,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: -1,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        tm_gmtoff: 0,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        tm_zone: std::ptr::null(),
+    };
+    let timestamp = unsafe { libc::mktime(&mut local) };
+    if timestamp == -1
+        || local.tm_year != year - 1900
+        || local.tm_mon != month - 1
+        || local.tm_mday != day
+    {
+        return None;
+    }
+    Some(timestamp as i64 * 1000)
+}
+
+fn parse_modified_range(value: &str) -> (Option<i64>, Option<i64>) {
+    let today = local_day_start(0);
+    match value {
+        "today" => (today, local_day_start(-1)),
+        "yesterday" => (local_day_start(1), today),
+        "last7d" | "7d" => (local_day_start(6), local_day_start(-1)),
+        "last30d" | "30d" => (local_day_start(29), local_day_start(-1)),
+        _ => {
+            let Some((from, to)) = value.split_once("..") else {
+                return (None, None);
+            };
+            let after = match from.is_empty() {
+                true => None,
+                false => match parse_local_date(from) {
+                    Some(date) => Some(date),
+                    None => return (None, None),
+                },
+            };
+            let before = match to.is_empty() {
+                true => None,
+                false => match local_date_start_after(to) {
+                    Some(date) => Some(date),
+                    None => return (None, None),
+                },
+            };
+            if after.zip(before).is_some_and(|(start, end)| start >= end) {
+                return (None, None);
+            }
+            (after, before)
+        }
+    }
+}
+
+fn local_date_start_after(value: &str) -> Option<i64> {
+    let timestamp = parse_local_date(value)? / 1000;
+    let timestamp = timestamp as libc::time_t;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let local_ptr = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) };
+    if local_ptr.is_null() {
+        return None;
+    }
+    let mut local = unsafe { local.assume_init() };
+    local.tm_mday += 1;
+    local.tm_hour = 0;
+    local.tm_min = 0;
+    local.tm_sec = 0;
+    local.tm_isdst = -1;
+    let timestamp = unsafe { libc::mktime(&mut local) };
+    (timestamp != -1).then_some(timestamp as i64 * 1000)
+}
+
 /// Subsequence match with a mild gap penalty. Lower rank is better.
 fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
+    if haystack.is_ascii() && needle.is_ascii() {
+        return fuzzy_score_ascii(haystack.as_bytes(), needle.as_bytes());
+    }
+    let haystack = haystack.to_lowercase();
+    fuzzy_score_unicode(&haystack, needle)
+}
+
+fn fuzzy_score_ascii(haystack: &[u8], needle: &[u8]) -> Option<i32> {
+    let equals = |left: u8, right: u8| left.eq_ignore_ascii_case(&right);
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if haystack.len() == needle.len()
+        && haystack
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| equals(*left, *right))
+    {
+        return Some(1200);
+    }
+    if haystack.len() >= needle.len()
+        && haystack[..needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| equals(*left, *right))
+    {
+        return Some(1000 - (haystack.len().saturating_sub(needle.len()) as i32 / 8));
+    }
+
+    for (position, window) in haystack.windows(needle.len()).enumerate() {
+        if window
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| equals(*left, *right))
+        {
+            let boundary = position == 0 || !haystack[position - 1].is_ascii_alphanumeric();
+            return Some(800 + if boundary { 120 } else { 0 } - (position as i32).min(200));
+        }
+    }
+
+    let mut cursor = 0usize;
+    let mut first = None;
+    let mut last = 0usize;
+    for wanted in needle {
+        while cursor < haystack.len() && !equals(haystack[cursor], *wanted) {
+            cursor += 1;
+        }
+        if cursor == haystack.len() {
+            return None;
+        }
+        first.get_or_insert(cursor);
+        last = cursor;
+        cursor += 1;
+    }
+    let span = last - first? + 1;
+    let gaps = span.saturating_sub(needle.len()) as i32;
+    Some(400 - gaps.min(300))
+}
+
+fn fuzzy_score_unicode(haystack: &str, needle: &str) -> Option<i32> {
     if needle.is_empty() {
         return Some(0);
     }
@@ -349,13 +555,16 @@ fn tag_matches(query: &[String], tag_names: &TagStore, entry: &Entry) -> bool {
 
 impl Entry {
     fn matches_query(&self, query: &SearchQuery, tags: &TagStore) -> bool {
-        if !tag_matches(&query.tags, tags, self) {
-            return false;
-        }
         if !query.extensions.is_empty() && !query.extensions.contains(&self.extension) {
             return false;
         }
         if !query.types.is_empty() && !query.types.iter().any(|kind| kind.matches(self)) {
+            return false;
+        }
+        if query.files_only && self.is_dir {
+            return false;
+        }
+        if query.folders_only && !self.is_dir {
             return false;
         }
         if let Some(min) = query.min_size {
@@ -368,17 +577,32 @@ impl Entry {
                 return false;
             }
         }
+        if self.modified_ms > 0.0 {
+            let modified_ms = self.modified_ms as i64;
+            if query
+                .modified_after_ms
+                .is_some_and(|after| modified_ms < after)
+                || query
+                    .modified_before_ms
+                    .is_some_and(|before| modified_ms >= before)
+            {
+                return false;
+            }
+        } else if query.modified_after_ms.is_some() || query.modified_before_ms.is_some() {
+            return false;
+        }
+        if !tag_matches(&query.tags, tags, self) {
+            return false;
+        }
         true
     }
 
     fn score(&self, terms: &[String]) -> Option<i32> {
         let mut total = 0i32;
-        let name = self.name.to_lowercase();
-        let extension = self.extension.to_lowercase();
 
         for term in terms {
-            total += fuzzy_score(&name, term)?;
-            if extension.contains(term) {
+            total += fuzzy_score(&self.name, term)?;
+            if self.extension.contains(term) {
                 total += 80;
             }
         }
@@ -399,6 +623,15 @@ impl PartialEq for ScoredEntry {
 
 impl Eq for ScoredEntry {}
 
+fn compare_display_paths(left: &Entry, right: &Entry) -> CmpOrdering {
+    match (left.display_path.is_empty(), right.display_path.is_empty()) {
+        (false, false) => natural_cmp(&left.display_path, &right.display_path),
+        (true, false) => natural_cmp(&crate::ops::display_path(&left.path), &right.display_path),
+        (false, true) => natural_cmp(&left.display_path, &crate::ops::display_path(&right.path)),
+        (true, true) => CmpOrdering::Equal,
+    }
+}
+
 impl PartialOrd for ScoredEntry {
     fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
         Some(self.cmp(other))
@@ -411,7 +644,7 @@ impl Ord for ScoredEntry {
             .score
             .cmp(&self.score)
             .then_with(|| natural_cmp(&self.entry.name, &other.entry.name))
-            .then_with(|| natural_cmp(&self.entry.display_path, &other.entry.display_path))
+            .then_with(|| compare_display_paths(&self.entry, &other.entry))
             .then_with(|| self.entry.path.cmp(&other.entry.path))
     }
 }
@@ -421,6 +654,14 @@ pub struct SearchOutcome {
     pub hits: Vec<Entry>,
     pub truncated: bool,
     pub cancelled: bool,
+    pub visited: usize,
+}
+
+pub struct SearchUpdate {
+    pub hits: Vec<Entry>,
+    pub append: bool,
+    pub complete: bool,
+    pub truncated: bool,
     pub visited: usize,
 }
 
@@ -434,12 +675,54 @@ pub fn search(
     cancel: &AtomicBool,
     max_results: usize,
 ) -> SearchOutcome {
-    let query = SearchQuery::parse(raw_query);
+    search_with_updates(
+        root,
+        raw_query,
+        "",
+        recursive,
+        show_hidden,
+        tags,
+        icons,
+        cancel,
+        max_results,
+        |_| {},
+    )
+}
+
+pub fn search_with_updates(
+    root: &Path,
+    raw_query: &str,
+    raw_filters: &str,
+    recursive: bool,
+    show_hidden: bool,
+    tags: &TagStore,
+    icons: &Arc<IconResolver>,
+    cancel: &AtomicBool,
+    max_results: usize,
+    mut on_update: impl FnMut(SearchUpdate),
+) -> SearchOutcome {
+    let query_text = format!("{raw_query} {raw_filters}");
+    let query = SearchQuery::parse(&query_text);
     let mut outcome = SearchOutcome::default();
     if query.is_empty() {
+        on_update(SearchUpdate {
+            hits: Vec::new(),
+            append: false,
+            complete: true,
+            truncated: false,
+            visited: 0,
+        });
         return outcome;
     }
+    let show_hidden = show_hidden || query.include_hidden;
     let Ok(root_meta) = std::fs::metadata(root) else {
+        on_update(SearchUpdate {
+            hits: Vec::new(),
+            append: false,
+            complete: true,
+            truncated: false,
+            visited: 0,
+        });
         return outcome;
     };
     let root_device = {
@@ -448,6 +731,9 @@ pub fn search(
     };
     let mut scored = BinaryHeap::new();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut pending = Vec::new();
+    let mut displayed = 0usize;
+    let mut first_update_sent = false;
 
     while let Some((directory, depth)) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
@@ -457,66 +743,98 @@ pub fn search(
         if !recursive && depth > 0 {
             continue;
         }
-        let entries = match read_directory_for_search(directory.as_path(), show_hidden) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        outcome.visited += entries.len();
-        for mut entry in entries {
+        let current_depth = depth;
+        let mut should_stop = false;
+        let result = visit_directory_for_search(directory.as_path(), show_hidden, |entry| {
+            outcome.visited += 1;
             if cancel.load(Ordering::Relaxed) {
                 outcome.cancelled = true;
-                break;
+                should_stop = true;
+                return false;
             }
-            entry.tag = tags.tag_for(&entry.path, entry.dev, entry.ino);
-            let entry_path = entry.path.clone();
-            // Compute same-device early, before entry might be moved below.
-            let same_device = if recursive
+            let same_device = recursive
                 && entry.is_dir
                 && !entry.is_symlink
-                && depth < MAX_DEPTH
+                && current_depth < MAX_DEPTH
                 && !SKIP_DIRS.contains(&entry.name.as_str())
-            {
-                entry.dev == root_device
-            } else {
-                false
-            };
-            if entry.matches_query(&query, tags) {
-                if let Some(score) = entry.score(&query.terms) {
-                    entry.display_path = crate::ops::display_path(&entry_path);
-                    let icon_names = if entry.is_symlink && entry.kind == "Broken link" {
-                        vec!["emblem-broken-link", "text-x-generic"]
-                    } else {
-                        icon_names_for(&entry.name, entry.is_dir, &entry.extension)
-                    };
-                    entry.icon_url = icons.resolve_first(&icon_names).unwrap_or_default();
-                    if max_results == 0 {
-                        outcome.truncated = true;
-                    } else {
-                        let candidate = ScoredEntry { score, entry };
-                        if scored.len() < max_results {
-                            scored.push(candidate);
-                        } else {
-                            outcome.truncated = true;
-                            if scored
-                                .peek()
-                                .is_some_and(|worst| candidate.cmp(worst) == CmpOrdering::Less)
-                            {
-                                scored.pop();
-                                scored.push(candidate);
-                            }
-                        }
-                    }
-                }
-                if same_device {
-                    stack.push((entry_path, depth + 1));
-                }
-            } else if same_device {
-                stack.push((entry_path, depth + 1));
+                && entry.dev == root_device;
+            if same_device {
+                stack.push((entry.path.clone(), current_depth + 1));
             }
+            if !entry.matches_query(&query, tags) {
+                return true;
+            }
+            let Some(score) = entry.score(&query.terms) else {
+                return true;
+            };
+            if max_results == 0 {
+                outcome.truncated = true;
+                return true;
+            }
+
+            let mut candidate = ScoredEntry { score, entry };
+            if scored.len() == max_results {
+                outcome.truncated = true;
+                if !scored
+                    .peek()
+                    .is_some_and(|worst| candidate.cmp(worst) == CmpOrdering::Less)
+                {
+                    return true;
+                }
+                scored.pop();
+            }
+            candidate.entry.tag = tags.tag_for(
+                &candidate.entry.path,
+                candidate.entry.dev,
+                candidate.entry.ino,
+            );
+            candidate.entry.display_path = crate::ops::display_path(&candidate.entry.path);
+            let icon_names = if candidate.entry.is_symlink && candidate.entry.kind == "Broken link"
+            {
+                vec!["emblem-broken-link", "text-x-generic"]
+            } else {
+                icon_names_for(
+                    &candidate.entry.name,
+                    candidate.entry.is_dir,
+                    &candidate.entry.extension,
+                )
+            };
+            candidate.entry.icon_url = icons.resolve_first(&icon_names).unwrap_or_default();
+            if displayed < max_results {
+                pending.push(candidate.entry.clone());
+                displayed += 1;
+            }
+            scored.push(candidate);
+            if (!first_update_sent && !pending.is_empty()) || pending.len() >= 32 {
+                on_update(SearchUpdate {
+                    hits: std::mem::take(&mut pending),
+                    append: true,
+                    complete: false,
+                    truncated: outcome.truncated,
+                    visited: outcome.visited,
+                });
+                first_update_sent = true;
+            }
+            true
+        });
+        if result.is_err() {
+            // Unreadable subdirectories are intentionally skipped.
+        }
+        if should_stop {
+            break;
         }
         if outcome.visited >= MAX_VISITED {
             outcome.truncated = true;
             break;
+        }
+        if !pending.is_empty() {
+            on_update(SearchUpdate {
+                hits: std::mem::take(&mut pending),
+                append: true,
+                complete: false,
+                truncated: outcome.truncated,
+                visited: outcome.visited,
+            });
         }
     }
 
@@ -525,10 +843,17 @@ pub fn search(
         b.score
             .cmp(&a.score)
             .then_with(|| natural_cmp(&a.entry.name, &b.entry.name))
-            .then_with(|| natural_cmp(&a.entry.display_path, &b.entry.display_path))
+            .then_with(|| compare_display_paths(&a.entry, &b.entry))
             .then_with(|| a.entry.path.cmp(&b.entry.path))
     });
     outcome.hits = scored.into_iter().map(|hit| hit.entry).collect();
+    on_update(SearchUpdate {
+        hits: outcome.hits.clone(),
+        append: false,
+        complete: true,
+        truncated: outcome.truncated,
+        visited: outcome.visited,
+    });
     outcome
 }
 
@@ -539,13 +864,36 @@ pub fn search_entries(
     cancel: &AtomicBool,
     max_results: usize,
 ) -> SearchOutcome {
-    let query = SearchQuery::parse(raw_query);
+    search_entries_with_updates(raw_query, "", entries, tags, cancel, max_results, |_| {})
+}
+
+pub fn search_entries_with_updates(
+    raw_query: &str,
+    raw_filters: &str,
+    entries: &[Entry],
+    tags: &TagStore,
+    cancel: &AtomicBool,
+    max_results: usize,
+    mut on_update: impl FnMut(SearchUpdate),
+) -> SearchOutcome {
+    let query_text = format!("{raw_query} {raw_filters}");
+    let query = SearchQuery::parse(&query_text);
     let mut outcome = SearchOutcome::default();
     if query.is_empty() {
+        on_update(SearchUpdate {
+            hits: Vec::new(),
+            append: false,
+            complete: true,
+            truncated: false,
+            visited: 0,
+        });
         return outcome;
     }
 
     let mut scored = BinaryHeap::new();
+    let mut pending = Vec::new();
+    let mut displayed = 0usize;
+    let mut first_update_sent = false;
     for entry in entries {
         if cancel.load(Ordering::Relaxed) {
             outcome.cancelled = true;
@@ -558,13 +906,39 @@ pub fn search_entries(
         let Some(score) = entry.score(&query.terms) else {
             continue;
         };
-        scored.push(ScoredEntry {
+        if max_results == 0 {
+            outcome.truncated = true;
+            continue;
+        }
+        let candidate = ScoredEntry {
             score,
             entry: entry.clone(),
-        });
-        if scored.len() > max_results {
-            scored.pop();
+        };
+        if scored.len() < max_results {
+            if displayed < max_results {
+                pending.push(candidate.entry.clone());
+                displayed += 1;
+            }
+            scored.push(candidate);
+        } else {
             outcome.truncated = true;
+            if scored
+                .peek()
+                .is_some_and(|worst| candidate.cmp(worst) == CmpOrdering::Less)
+            {
+                scored.pop();
+                scored.push(candidate);
+            }
+        }
+        if (!first_update_sent && !pending.is_empty()) || pending.len() >= 32 {
+            on_update(SearchUpdate {
+                hits: std::mem::take(&mut pending),
+                append: true,
+                complete: false,
+                truncated: outcome.truncated,
+                visited: outcome.visited,
+            });
+            first_update_sent = true;
         }
     }
     outcome.hits = scored
@@ -572,6 +946,13 @@ pub fn search_entries(
         .into_iter()
         .map(|hit| hit.entry)
         .collect();
+    on_update(SearchUpdate {
+        hits: outcome.hits.clone(),
+        append: false,
+        complete: true,
+        truncated: outcome.truncated,
+        visited: outcome.visited,
+    });
     outcome
 }
 
@@ -659,10 +1040,86 @@ mod tests {
         assert_eq!(parse_size("1.5M"), Some(1_572_864));
         assert_eq!(parse_size_range(">5M").0, Some(5 * 1024 * 1024));
         assert_eq!(parse_size_range("<5M").1, Some(5 * 1024 * 1024));
+        assert_eq!(parse_size_range("empty"), (Some(0), Some(0)));
+        assert_eq!(parse_size_range("small"), (Some(1), Some(1024 * 1024)));
+        assert_eq!(
+            parse_size_range("medium"),
+            (Some(1024 * 1024 + 1), Some(100 * 1024 * 1024))
+        );
+        assert_eq!(parse_size_range("large").0, Some(100 * 1024 * 1024 + 1));
         assert_eq!(
             parse_size_range("1M..2M"),
             (Some(1_048_576), Some(2_097_152))
         );
+    }
+
+    #[test]
+    fn advanced_filters_parse_and_match_file_metadata() {
+        let query = SearchQuery::parse(
+            "type:document size:empty modified:2026-04-04..2026-04-04 hidden:true kind:files",
+        );
+        let mut file = entry("report.pdf", "pdf", false, 0, -1);
+        file.is_hidden = true;
+        file.modified_ms = parse_local_date("2026-04-04").unwrap() as f64;
+        assert!(file.matches_query(&query, &TagStore::default()));
+
+        file.size = 10;
+        assert!(!file.matches_query(&query, &TagStore::default()));
+        file.size = 0;
+        file.is_dir = true;
+        assert!(!file.matches_query(&query, &TagStore::default()));
+        assert!(parse_local_date("2026-02-31").is_none());
+    }
+
+    #[test]
+    fn date_presets_are_bounded_by_local_calendar_days() {
+        let today = SearchQuery::parse("modified:today");
+        let yesterday = SearchQuery::parse("modified:yesterday");
+        let week = SearchQuery::parse("modified:last7d");
+        assert!(today.modified_after_ms < today.modified_before_ms);
+        assert_eq!(today.modified_after_ms, yesterday.modified_before_ms);
+        assert!(week.modified_after_ms < today.modified_after_ms);
+        assert_eq!(week.modified_before_ms, today.modified_before_ms);
+    }
+
+    #[test]
+    fn traversal_filters_hidden_files_and_emits_results_before_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".hidden-report.txt"), b"").unwrap();
+        fs::write(dir.path().join("visible-report.txt"), b"").unwrap();
+        let mut updates = Vec::new();
+        let outcome = search_with_updates(
+            dir.path(),
+            "report",
+            "hidden:true kind:files",
+            false,
+            false,
+            &TagStore::default(),
+            &Arc::new(IconResolver::new()),
+            &AtomicBool::new(false),
+            50,
+            |update| updates.push(update),
+        );
+        assert_eq!(outcome.hits.len(), 2);
+        assert!(updates
+            .iter()
+            .any(|update| update.append && !update.hits.is_empty()));
+        assert!(updates
+            .last()
+            .is_some_and(|update| update.complete && !update.append));
+
+        let outcome = search(
+            dir.path(),
+            "report",
+            false,
+            false,
+            &TagStore::default(),
+            &Arc::new(IconResolver::new()),
+            &AtomicBool::new(false),
+            50,
+        );
+        assert_eq!(outcome.hits.len(), 1);
+        assert_eq!(outcome.hits[0].name, "visible-report.txt");
     }
 
     #[test]
@@ -812,5 +1269,87 @@ mod tests {
         assert_eq!(outcome.hits.len(), 1);
         assert_eq!(outcome.hits[0].name, "target");
         assert!(outcome.truncated);
+    }
+
+    #[test]
+    #[ignore = "manual filesystem-search performance benchmark"]
+    fn benchmark_search_workloads() {
+        use std::time::Instant;
+
+        fn cpu_millis() -> i64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+            if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+                return 0;
+            }
+            let usage = unsafe { usage.assume_init() };
+            (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1000
+                + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1000
+        }
+
+        fn resident_kib() -> usize {
+            let pages = fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|value| value.split_whitespace().nth(1)?.parse::<usize>().ok())
+                .unwrap_or_default();
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+            pages.saturating_mul(page_size) / 1024
+        }
+
+        fn peak_resident_kib() -> usize {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+            if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+                return 0;
+            }
+            unsafe { usage.assume_init().ru_maxrss as usize }
+        }
+
+        for count in [1_000usize, 10_000, 20_000] {
+            let dir = tempfile::tempdir().unwrap();
+            let extensions = ["txt", "jpg", "mp4", "zip", "pdf"];
+            for index in 0..count {
+                let stem = if index % 4 == 0 { "match" } else { "item" };
+                fs::write(
+                    dir.path()
+                        .join(format!("{stem}-{index}.{}", extensions[index % 5])),
+                    [],
+                )
+                .unwrap();
+            }
+
+            let started = Instant::now();
+            let cpu_before = cpu_millis();
+            let rss_before = resident_kib();
+            let mut first_result_ms = None;
+            let outcome = search_with_updates(
+                dir.path(),
+                "match",
+                "",
+                true,
+                false,
+                &TagStore::default(),
+                &Arc::new(IconResolver::new()),
+                &AtomicBool::new(false),
+                400,
+                |update| {
+                    if first_result_ms.is_none() && !update.hits.is_empty() {
+                        first_result_ms = Some(started.elapsed().as_millis());
+                    }
+                },
+            );
+            let cpu_after = cpu_millis();
+            let rss_after = resident_kib();
+            let peak_rss = peak_resident_kib();
+            eprintln!(
+                "search-benchmark files={count} visited={} hits={} first_result_ms={} completion_ms={} cpu_ms={} rss_before_kib={} rss_after_kib={} peak_rss_kib={peak_rss}",
+                outcome.visited,
+                outcome.hits.len(),
+                first_result_ms.unwrap_or_default(),
+                started.elapsed().as_millis(),
+                cpu_after - cpu_before,
+                rss_before,
+                rss_after
+            );
+            assert_eq!(outcome.visited, count);
+        }
     }
 }

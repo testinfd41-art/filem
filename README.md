@@ -170,6 +170,11 @@ Noctalia configuration or its generated `theme.json`. Window blur must be
 configured as a rule in the desktop compositor; there is no portable in-app
 blur setting.
 
+When an external theme file or Noctalia settings are newer than a saved Filem
+mode, the external mode takes precedence and Filem removes only that outdated
+mode override. Other appearance settings are preserved. A later manual mode
+toggle remains active until the next external theme update.
+
 ### Optional Noctalia integration
 
 Filem never edits Noctalia's configuration. To let Noctalia render Filem's theme

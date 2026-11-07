@@ -7,7 +7,14 @@ Rectangle {
     property var backend
     property var area
 
-    readonly property string entryPath: path
+    // Model roles are read through the qualified "model." wrapper, matching
+    // the grid delegate. Unqualified role lookups proved unreliable: they
+    // could return undefined during delegate refresh and, critically, a stale
+    // isDir at drop time resolved cross-window drops to the wrong folder.
+    readonly property string entryPath: model.path || ""
+    readonly property string rowKind: model.kind || ""
+    readonly property string rowDisplayPath: model.displayPath || ""
+    readonly property bool rowIsDir: model.isDir === true
     readonly property bool selected: area ? area.isSelected(entryPath) : false
     readonly property bool hovered: rowMouse.containsMouse && !selected
     readonly property bool dragged: area && area.dragActive
@@ -15,50 +22,51 @@ Rectangle {
     readonly property bool focused: ListView.view
                                     && ListView.view.activeFocus
                                     && ListView.view.currentIndex === index
-    readonly property bool cut: area ? area.isCut(entryPath) : false
+    readonly property bool clipboardItem: area ? area.isClipboardItem(entryPath) : false
     readonly property bool renaming: backend ? backend.renaming_path === entryPath : false
     readonly property bool treeEnabled: area && backend
                                         && backend.view_mode === "list"
                                         && !backend.search_mode
                                         && !backend.virtual_collection
-    readonly property int treeIndent: treeEnabled ? Math.min(treeDepth, 16) * 14 : 0
+    readonly property int treeIndent: treeEnabled ? Math.min(model.treeDepth, 16) * 14 : 0
     readonly property real listFontScale: root.area
                                           ? (root.area.zoom > 1
                                              ? 1 + (root.area.zoom - 1) * 0.1
                                              : root.area.zoom)
                                           : 1
-    readonly property bool dragTarget: isDir && area
+    readonly property bool dragTarget: rowIsDir && area
                                       && ((area.dragActive && area.dragHoverPath === entryPath)
                                           || rowDropArea.containsDrag)
     readonly property bool imageThumbnail: [
         "png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "tif", "tiff", "avif", "ico",
         "heic", "heif", "jxl", "tga", "jp2", "j2k"
-    ].indexOf((extension || "").toLowerCase()) >= 0
+    ].indexOf((model.extension || "").toLowerCase()) >= 0
     readonly property bool generatedThumbnail: (imageThumbnail
-                                                && (extension || "").toLowerCase() !== "svg")
+                                                && (model.extension || "").toLowerCase() !== "svg")
             || [
                 "pdf", "mp4", "mkv", "webm", "avi", "mov", "m4v", "mpg", "mpeg", "ogv",
                 "flv", "wmv", "3gp", "3g2", "ts", "mts", "m2ts", "vob",
                 "mp3", "flac", "ogg", "oga", "opus", "m4a", "m4b", "wav", "wave", "aac",
                 "wma", "aif", "aiff", "ape", "wv", "3ga"
-            ].indexOf((extension || "").toLowerCase()) >= 0
-    readonly property string thumbnailVersion: sizeText + "\u0000" + modifiedMs
+            ].indexOf((model.extension || "").toLowerCase()) >= 0
+    readonly property string thumbnailVersion: (model.sizeText || "") + "\u0000"
+                                               + (model.modifiedMs || 0)
     readonly property bool thumbnailInViewport: ListView.view
                                                 && y + height > ListView.view.contentY
                                                 && y < ListView.view.contentY + ListView.view.height
     property string thumbnailSource: ""
 
     function refreshThumbnail() {
-        if (!backend || isDir)
+        if (!backend || rowIsDir)
             return
-        if (imageThumbnail && (extension || "").toLowerCase() === "svg") {
+        if (imageThumbnail && (model.extension || "").toLowerCase() === "svg") {
             thumbnailSource = backend.file_url(entryPath)
         } else if (generatedThumbnail) {
             var cached = backend.thumbnail_url(entryPath)
             if (cached !== "") {
                 setThumbnailSource(cached)
             } else {
-                setThumbnailSource(iconUrl)
+                setThumbnailSource(model.iconUrl || "")
                 if (thumbnailInViewport)
                     backend.request_thumbnail(entryPath, true)
             }
@@ -76,7 +84,7 @@ Rectangle {
     onEntryPathChanged: refreshThumbnail()
     onThumbnailVersionChanged: refreshThumbnail()
     onThumbnailInViewportChanged: {
-        if (thumbnailInViewport && generatedThumbnail && thumbnailSource === iconUrl)
+        if (thumbnailInViewport && generatedThumbnail && thumbnailSource === model.iconUrl)
             refreshThumbnail()
     }
 
@@ -91,7 +99,6 @@ Rectangle {
 
     width: ListView.view ? ListView.view.width : 0
     height: root.area ? root.area.effectiveRowHeight : (theme ? theme.row_height : 34)
-    opacity: cut ? 0.55 : 1.0
     color: dragTarget
            ? (theme ? Qt.rgba(theme.accent.r, theme.accent.g, theme.accent.b, 0.22) : "#337ea7ff")
            : (selected
@@ -131,11 +138,11 @@ Rectangle {
     }
 
     function toggleTree() {
-        if (!root.backend || !root.area || !treeExpandable)
+        if (!root.backend || !root.area || !model.treeExpandable)
             return
         root.area.activeView().currentIndex = index
         root.area.activeView().forceActiveFocus()
-        root.backend.set_tree_path_expanded(root.entryPath, !treeExpanded)
+        root.backend.set_tree_path_expanded(root.entryPath, !model.treeExpanded)
     }
 
     // Narrow adjacent stripes show multiple tags without taking a full column.
@@ -158,6 +165,14 @@ Rectangle {
         anchors.leftMargin: 12
         anchors.rightMargin: 12
         spacing: 8
+        opacity: root.clipboardItem ? 0.52 : 1
+
+        Behavior on opacity {
+            NumberAnimation {
+                duration: 160
+                easing.type: Easing.InOutCubic
+            }
+        }
 
         Item {
             width: root.area ? root.area.nameWidth(root.width) : Math.max(80, root.width - 360)
@@ -174,13 +189,13 @@ Rectangle {
 
                 Item {
                     id: disclosureControl
-                    width: root.treeEnabled && treeExpandable ? 14 : 0
+                    width: root.treeEnabled && model.treeExpandable ? 14 : 0
                     height: parent.height
                     visible: width > 0
 
                     Text {
                         anchors.centerIn: parent
-                        text: treeExpanded ? "\u2304" : "\u203a"
+                        text: model.treeExpanded ? "\u2304" : "\u203a"
                         color: root.selected
                                ? (theme ? theme.selection_text : "#f2f5fb")
                                : (theme ? theme.muted : "#9299a8")
@@ -194,13 +209,13 @@ Rectangle {
                     anchors.verticalCenter: parent.verticalCenter
                     width: 24 * (root.area ? root.area.zoom : 1.0)
                     height: width
-                    source: root.thumbnailSource || iconUrl
+                    source: root.thumbnailSource || model.iconUrl || ""
                     sourceSize.width: width
                     sourceSize.height: height
                     smooth: true
                     fillMode: Image.PreserveAspectFit
                     asynchronous: true
-                    cache: true
+                    cache: false
                     visible: source.toString() !== ""
                 }
 
@@ -208,29 +223,31 @@ Rectangle {
                     id: fileNameText
                     visible: !root.renaming
                     width: Math.max(0, parent.width
-                                    - (iconUrl !== "" ? 26 * (root.area ? root.area.zoom : 1.0) : 0)
+                                    - ((model.iconUrl || "") !== ""
+                                       ? 26 * (root.area ? root.area.zoom : 1.0) : 0)
                                     - root.treeIndent
-                                    - (root.treeEnabled && treeExpandable ? 22 : 0))
+                                    - (root.treeEnabled && model.treeExpandable ? 22 : 0))
                     anchors.verticalCenter: parent.verticalCenter
-                    text: name + (isSymlink ? "  \u2192" : "")
+                    text: (model.name || "") + (model.isSymlink ? "  \u2192" : "")
                     elide: Text.ElideMiddle
                     color: root.selected
                            ? (theme ? theme.selection_text : "#f2f5fb")
                            : (theme ? theme.foreground : "#e7e9ee")
                     font.family: theme ? theme.font_family : "sans-serif"
                     font.pixelSize: 13 * root.listFontScale * (theme ? theme.font_scale : 1)
-                    font.weight: isDir ? Font.Medium : Font.Normal
+                    font.weight: rowIsDir ? Font.Medium : Font.Normal
                 }
 
                 TextInput {
                     id: renameInput
                     visible: root.renaming
                     width: Math.max(0, parent.width
-                                    - (iconUrl !== "" ? 26 * (root.area ? root.area.zoom : 1.0) : 0)
+                                    - ((model.iconUrl || "") !== ""
+                                       ? 26 * (root.area ? root.area.zoom : 1.0) : 0)
                                     - root.treeIndent
-                                    - (root.treeEnabled && treeExpandable ? 22 : 0))
+                                    - (root.treeEnabled && model.treeExpandable ? 22 : 0))
                     anchors.verticalCenter: parent.verticalCenter
-                    text: name
+                    text: model.name || ""
                     color: theme ? theme.foreground : "#e7e9ee"
                     selectionColor: theme ? theme.selection : "#24364f"
                     selectedTextColor: theme ? theme.selection_text : "#f2f5fb"
@@ -273,7 +290,7 @@ Rectangle {
             height: parent.height
             horizontalAlignment: Text.AlignRight
             verticalAlignment: Text.AlignVCenter
-            text: sizeText
+            text: model.sizeText || ""
             elide: Text.ElideRight
             color: root.selected
                    ? (theme ? theme.selection_text : "#f2f5fb")
@@ -287,8 +304,8 @@ Rectangle {
             width: visible ? (root.area ? root.area.modifiedWidth : 150) : 0
             height: parent.height
             verticalAlignment: Text.AlignVCenter
-            text: modifiedMs > 0
-                  ? Qt.formatDateTime(new Date(modifiedMs), "d MMM yyyy  HH:mm")
+            text: (model.modifiedMs || 0) > 0
+                  ? Qt.formatDateTime(new Date(model.modifiedMs), "d MMM yyyy  HH:mm")
                   : "\u2014"
             elide: Text.ElideRight
             color: root.selected
@@ -306,8 +323,8 @@ Rectangle {
             // Search results and trashed items are identified by where they
             // live, which is more useful than repeating the file kind.
             text: root.backend && (root.backend.recent_view || root.backend.tag_collection_view)
-                  ? kind + " \u00b7 " + displayPath
-                  : (displayPath !== "" ? displayPath : kind)
+                  ? rowKind + " \u00b7 " + rowDisplayPath
+                  : (rowDisplayPath !== "" ? rowDisplayPath : rowKind)
             elide: Text.ElideMiddle
             color: root.selected
                    ? (theme ? theme.selection_text : "#f2f5fb")
@@ -323,7 +340,8 @@ Rectangle {
         z: 2
         keys: ["text/uri-list", "filem/paths"]
         onEntered: {
-            if (root.isDir && root.area) {
+            console.warn("RECV row entered", root.entryPath, "internal", root.area.dragActive)
+            if (root.rowIsDir && root.area) {
                 if (root.area.dragActive)
                     root.area.setDragHoverPath(root.entryPath)
                 root.area.beginFolderHover(root.entryPath)
@@ -336,31 +354,24 @@ Rectangle {
                 root.area.endFolderHover(root.entryPath)
         }
         onDropped: function(drop) {
+            console.warn("RECV row dropped", root.entryPath,
+                         drop.proposedAction, drop.urls ? drop.urls.length : 0)
             if (!root.area)
                 return
             if (root.area.dragActive) {
-                if (root.isDir
+                if (root.rowIsDir
                         && root.area.dropDraggedPaths(root.entryPath, drop.proposedAction))
                     drop.acceptProposedAction()
             } else if (root.area.dropExternalPaths(
-                           drop, root.isDir ? root.entryPath : root.backend.current_path)) {
+                           drop, root.rowIsDir ? root.entryPath : root.backend.current_path)) {
                 drop.acceptProposedAction()
             }
         }
     }
 
-    function isRowEmptySpace(x) {
-        var iconStart = 12 + root.treeIndent + (root.treeEnabled && treeExpandable ? 22 : 0)
-        if (x < iconStart)
-            return true
-        var iconWidth = 24 * (root.area ? root.area.zoom : 1.0)
-        var nameWidth = fileNameText ? fileNameText.paintedWidth : 120
-        var iconAndNameEnd = iconStart + (iconUrl !== "" ? iconWidth + 8 : 0) + nameWidth + 8
-        return x > iconAndNameEnd
-    }
-
     MouseArea {
         id: rowMouse
+        objectName: "fileRowMouseArea"
         anchors.fill: parent
         // Put pointer tracking above the row visuals; the rename editor must
         // retain input ownership while it is active.
@@ -379,6 +390,8 @@ Rectangle {
         property bool isMarqueeGesture: false
 
         onPressed: function(mouse) {
+            console.warn("ROW pressed", root.entryPath, "selected", root.area.isSelected(root.entryPath),
+                         "selecting", root.area.selectingByMouse, "dragActive", root.area.dragActive)
             if (mouse.button !== Qt.LeftButton)
                 return
             if (!root.area)
@@ -393,18 +406,19 @@ Rectangle {
             pressModifiers = mouse.modifiers
             dragOrigin = Qt.point(mouse.x, mouse.y)
             pressedSelected = root.area.isSelected(root.entryPath)
-            isMarqueeGesture = !pressedSelected && !(mouse.modifiers & Qt.ShiftModifier) && root.isRowEmptySpace(mouse.x)
+            isMarqueeGesture = !pressedSelected
+                    && root.area.isMarqueeStart(mouse.x, mouse.y, width, height)
 
             root.area.activeView().currentIndex = index
             root.area.activeView().forceActiveFocus()
             root.area.setDragHoverPath("")
 
-            if (!isMarqueeGesture) {
+            if (!isMarqueeGesture && !pressedSelected) {
                 if (mouse.modifiers & Qt.ShiftModifier)
                     root.area.extendSelection(index)
                 else if (mouse.modifiers & Qt.ControlModifier)
                     root.area.toggleSelection(root.entryPath, index)
-                else if (!pressedSelected)
+                else
                     root.area.setSingleSelection(root.entryPath, index)
             }
         }
@@ -415,6 +429,7 @@ Rectangle {
             var moved = Math.abs(mouse.x - dragOrigin.x) + Math.abs(mouse.y - dragOrigin.y)
             if (moved <= Qt.styleHints.startDragDistance)
                 return
+            console.warn("ROW threshold", root.entryPath, moved, "marquee", isMarqueeGesture)
 
             suppressClick = true
 
@@ -429,16 +444,14 @@ Rectangle {
                 return
             }
 
+            var areaPoint = mapToItem(root.area, mouse.x, mouse.y)
             if (!dragStarted) {
                 dragStarted = true
-                var paths = root.area.selectedPaths()
-                if (paths.indexOf(root.entryPath) < 0)
-                    paths = [root.entryPath]
-                root.area.beginDrag(paths, pressModifiers, root.iconUrl)
+                console.warn("ROW beginDrag", root.entryPath)
+                root.area.beginDrag(root.entryPath, pressModifiers, model.iconUrl || "", areaPoint)
             }
 
             if (root.area.dragActive) {
-                var areaPoint = mapToItem(root.area, mouse.x, mouse.y)
                 root.area.updateDragPointer(areaPoint.x, areaPoint.y)
             }
         }
@@ -472,7 +485,7 @@ Rectangle {
                 dragStarted = false
                 if (root.area && root.area.dragActive) {
                     var areaPoint = mapToItem(root.area, mouse.x, mouse.y)
-                    root.area.finishInternalDrag(areaPoint.x, areaPoint.y)
+                    root.area.finishPointerDrag(areaPoint.x, areaPoint.y)
                 }
                 dragOrigin = Qt.point(0, 0)
                 return
@@ -491,6 +504,7 @@ Rectangle {
         }
 
         onCanceled: {
+            console.warn("ROW canceled", root.entryPath, "dragStarted", dragStarted)
             preventStealing = false
             dragging = false
             if (isMarqueeGesture) {
@@ -501,7 +515,7 @@ Rectangle {
             } else if (dragStarted) {
                 dragStarted = false
                 if (root.area)
-                    root.area.finishDrag()
+                    root.area.cancelPointerDrag()
             }
             dragOrigin = Qt.point(0, 0)
         }
@@ -555,6 +569,6 @@ Rectangle {
     }
 
     Accessible.role: Accessible.ListItem
-    Accessible.name: name
-    Accessible.description: displayPath !== "" ? displayPath : kind
+    Accessible.name: model.name || root.entryPath
+    Accessible.description: rowDisplayPath !== "" ? rowDisplayPath : rowKind
 }

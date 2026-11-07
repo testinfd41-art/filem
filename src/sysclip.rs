@@ -10,6 +10,12 @@ use std::process::{Command, Stdio};
 
 use crate::paths::{expand_path, home_dir};
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClipboardSnapshot {
+    pub paths: Vec<PathBuf>,
+    pub cut: Option<bool>,
+}
+
 pub fn uri_list(paths: &[PathBuf]) -> String {
     let mut text = String::new();
     for path in paths {
@@ -60,12 +66,90 @@ pub fn write_paths(paths: &[PathBuf]) -> Result<(), String> {
     wl_copy("text/uri-list", &uri_list(paths))
 }
 
+pub fn clear() -> Result<(), String> {
+    if !tool_available("wl-copy") {
+        return Err(
+            "wl-copy is not available; using Filem's internal clipboard instead.".to_owned(),
+        );
+    }
+    let status = Command::new("wl-copy")
+        .arg("--clear")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("Could not clear the system clipboard: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Could not clear the system clipboard.".to_owned())
+    }
+}
+
 /// Put plain text on the system clipboard, used by "Copy path".
 pub fn write_text(text: &str) -> Result<(), String> {
     if text.is_empty() {
         return Ok(());
     }
     wl_copy("text/plain", text)
+}
+
+/// Read supported file clipboard formats without treating other MIME types as errors.
+pub fn read_clipboard() -> Option<ClipboardSnapshot> {
+    if !tool_available("wl-paste") {
+        return None;
+    }
+    let output = Command::new("wl-paste").arg("--list-types").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let types = String::from_utf8_lossy(&output.stdout);
+
+    if types
+        .lines()
+        .any(|mime| mime.trim() == "x-special/gnome-copied-files")
+    {
+        let output = Command::new("wl-paste")
+            .args(["--no-newline", "--type", "x-special/gnome-copied-files"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        return parse_gnome_copy_list(&text);
+    }
+
+    if types.lines().any(|mime| mime.trim() == "text/uri-list") {
+        let output = Command::new("wl-paste")
+            .args(["--no-newline", "--type", "text/uri-list"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return Some(ClipboardSnapshot {
+            paths: parse_uri_list(&String::from_utf8_lossy(&output.stdout)),
+            cut: None,
+        });
+    }
+
+    Some(ClipboardSnapshot {
+        paths: Vec::new(),
+        cut: None,
+    })
+}
+
+fn parse_gnome_copy_list(text: &str) -> Option<ClipboardSnapshot> {
+    let mut lines = text.lines();
+    let cut = match lines.next()?.trim() {
+        "cut" => true,
+        "copy" => false,
+        _ => return None,
+    };
+    Some(ClipboardSnapshot {
+        paths: parse_uri_list(&lines.collect::<Vec<_>>().join("\n")),
+        cut: Some(cut),
+    })
 }
 
 /// Read file URLs from the system clipboard, returning local paths only.
@@ -142,5 +226,17 @@ mod tests {
             parse_uri_list(text),
             vec![PathBuf::from("/tmp/x"), PathBuf::from("/tmp/y")]
         );
+    }
+
+    #[test]
+    fn gnome_clipboard_format_preserves_cut_state() {
+        let snapshot = parse_gnome_copy_list("cut\nfile:///tmp/a%20b\n").unwrap();
+        assert_eq!(snapshot.cut, Some(true));
+        assert_eq!(snapshot.paths, vec![PathBuf::from("/tmp/a b")]);
+        assert_eq!(
+            parse_gnome_copy_list("copy\nfile:///tmp/a\n").unwrap().cut,
+            Some(false)
+        );
+        assert!(parse_gnome_copy_list("move\nfile:///tmp/a\n").is_none());
     }
 }

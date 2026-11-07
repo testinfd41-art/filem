@@ -144,35 +144,28 @@ impl ThemeData {
             .ok()
             .and_then(|text| ThemeFile::parse(&text).ok());
         if let Some(appearance) = appearance {
-            return Self::apply_appearance(Self::load_base(), appearance);
+            let loaded = Self::load_base();
+            let use_appearance_mode =
+                appearance_mode_is_authoritative(&appearance_path, &loaded.source);
+            return Self::apply_appearance(loaded, appearance, use_appearance_mode);
         }
         Self::load_base()
     }
 
-    fn load_manual_mode(mode: &str) -> LoadedTheme {
-        let appearance = std::fs::read_to_string(appearance_file())
-            .ok()
-            .and_then(|text| ThemeFile::parse(&text).ok());
-        let mut data = Self::builtin_for_mode(mode);
-        if let Some(mut appearance) = appearance {
+    fn apply_appearance(
+        mut loaded: LoadedTheme,
+        mut appearance: ThemeFile,
+        use_appearance_mode: bool,
+    ) -> LoadedTheme {
+        if !use_appearance_mode {
             appearance.mode = None;
-            data = data.apply_file(appearance);
-        }
-        LoadedTheme {
-            data,
-            warning: None,
-            source: "manual".to_owned(),
-        }
-    }
-
-    fn apply_appearance(mut loaded: LoadedTheme, appearance: ThemeFile) -> LoadedTheme {
-        if let Some(mode) = appearance.mode.as_deref() {
-            if mode == "light" || mode == "dark" {
+        } else if let Some(mode) = appearance.mode.as_deref() {
+            if (mode == "light" || mode == "dark") && loaded.data.mode != mode {
                 loaded.data = ThemeData::builtin_for_mode(mode);
             }
         }
         loaded.data = loaded.data.apply_file(appearance);
-        loaded.source = "Filem appearance".to_owned();
+        loaded.source = format!("{} + Filem appearance", loaded.source);
         loaded
     }
 
@@ -214,8 +207,9 @@ impl ThemeData {
         let mode = noctalia
             .as_ref()
             .and_then(|settings| settings.theme.mode.clone())
-            .filter(|mode| mode == "light" || mode == "dark")
-            .unwrap_or_else(|| "dark".to_owned());
+            .filter(|mode| mode == "light" || mode == "dark");
+        let source = if mode.is_some() { "Noctalia" } else { "built-in" };
+        let mode = mode.unwrap_or_else(|| "dark".to_owned());
         let base = ThemeData::builtin_for_mode(&mode);
 
         if let Some(palette) = noctalia
@@ -232,7 +226,7 @@ impl ThemeData {
         LoadedTheme {
             data: base,
             warning: None,
-            source: "built-in".to_owned(),
+            source: source.to_owned(),
         }
     }
 
@@ -401,6 +395,37 @@ fn validated_appearance_value(key: &str, value: &str) -> Option<serde_json::Valu
     }
 }
 
+fn external_theme_path(source: &str) -> Option<PathBuf> {
+    match source {
+        "theme file" => Some(theme_file()),
+        "Noctalia" => noctalia_settings_path(),
+        _ => None,
+    }
+}
+
+fn appearance_mode_is_authoritative(appearance_path: &Path, source: &str) -> bool {
+    let Some(external_path) = external_theme_path(source) else {
+        return true;
+    };
+    let appearance_modified = std::fs::metadata(appearance_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let external_modified = std::fs::metadata(external_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    appearance_mode_is_newer(appearance_modified, external_modified)
+}
+
+fn appearance_mode_is_newer(
+    appearance_modified: Option<std::time::SystemTime>,
+    external_modified: Option<std::time::SystemTime>,
+) -> bool {
+    matches!(
+        (appearance_modified, external_modified),
+        (Some(appearance), Some(external)) if appearance > external
+    )
+}
+
 fn write_appearance_value(
     path: &Path,
     key: &str,
@@ -462,11 +487,44 @@ fn write_appearance_value(
         object.insert(key.to_owned(), value);
     }
 
+    persist_appearance_document(path, &document)
+}
+
+fn clear_appearance_mode(path: &Path) -> Result<bool, String> {
+    if std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err("appearance settings file must not be a symlink".to_owned());
+    }
+    if !path.exists() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let mut document = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|error| format!("invalid appearance settings: {error}"))?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "appearance settings must be a JSON object".to_owned())?;
+    if object.remove("mode").is_none() {
+        return Ok(false);
+    }
+    persist_appearance_document(path, &document)?;
+    Ok(true)
+}
+
+fn persist_appearance_document(path: &Path, document: &serde_json::Value) -> Result<(), String> {
+    if std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err("appearance settings file must not be a symlink".to_owned());
+    }
     let parent = path
         .parent()
         .ok_or_else(|| "appearance settings path has no parent".to_owned())?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?;
     let mut temp_path = None;
     let mut temp_file = None;
     for suffix in 0..100 {
@@ -704,7 +762,6 @@ pub struct Theme {
     set_appearance: qt_method!(fn(&mut self, key: QString, value: QString) -> bool),
 
     data: ThemeData,
-    manual_mode_override: Option<String>,
     watcher_started: bool,
 }
 
@@ -713,7 +770,6 @@ impl Default for Theme {
         let data = ThemeData::builtin_dark();
         Self {
             data,
-            manual_mode_override: None,
             watcher_started: false,
             base: Default::default(),
             mode: Default::default(),
@@ -793,26 +849,40 @@ impl Theme {
     }
 
     fn reload(&mut self) {
-        if let Some(mode) = self.manual_mode_override.clone() {
-            self.apply(ThemeData::load_manual_mode(&mode));
-            return;
+        let mut loaded = ThemeData::load();
+        if let Some(source) = loaded.source.strip_suffix(" + Filem appearance") {
+            if !appearance_mode_is_authoritative(&appearance_file(), source) {
+                match clear_appearance_mode(&appearance_file()) {
+                    Ok(true) => loaded = ThemeData::load(),
+                    Ok(false) => {}
+                    Err(error) => {
+                        loaded.warning = Some(format!(
+                            "Could not clear an outdated appearance mode: {error}"
+                        ));
+                    }
+                }
+            }
         }
-        let loaded = ThemeData::load();
         self.apply(loaded);
     }
 
     fn toggle_mode(&mut self) {
-        let current = self
-            .manual_mode_override
-            .clone()
-            .unwrap_or_else(|| self.data.mode.clone());
-        let target = if current == "light" {
+        let target = if self.data.mode == "light" {
             "dark".to_owned()
         } else {
             "light".to_owned()
         };
-        self.manual_mode_override = Some(target.clone());
-        self.apply(ThemeData::load_manual_mode(&target));
+        if let Err(error) = write_appearance_value(
+            &appearance_file(),
+            "mode",
+            serde_json::Value::String(target),
+            &self.data.tags,
+        ) {
+            self.warning = QString::from(format!("Could not save appearance: {error}"));
+            self.changed();
+            return;
+        }
+        self.reload();
     }
 
     fn tag_color(&self, index: i32) -> QString {
@@ -829,7 +899,6 @@ impl Theme {
         if write_appearance_value(&appearance_file(), &key, value, &self.data.tags).is_err() {
             return false;
         }
-        self.manual_mode_override = None;
         self.reload();
         true
     }
@@ -978,6 +1047,7 @@ mod tests {
                 source: "built-in".to_owned(),
             },
             appearance,
+            true,
         );
         assert_eq!(loaded.data.mode, "light");
         assert_eq!(
@@ -986,7 +1056,53 @@ mod tests {
         );
         assert_eq!(loaded.data.accent, "#123456");
         assert_eq!(loaded.data.font_size, 15.0);
-        assert_eq!(loaded.source, "Filem appearance");
+        assert_eq!(loaded.source, "built-in + Filem appearance");
+    }
+
+    #[test]
+    fn newer_external_theme_mode_wins_over_stale_appearance_mode() {
+        let appearance =
+            ThemeFile::parse(r##"{"mode":"dark","fontSize":15}"##).unwrap();
+        let external = ThemeData::builtin_light().apply_file(
+            ThemeFile::parse(r##"{"accent":"#123456"}"##).unwrap(),
+        );
+        let loaded = ThemeData::apply_appearance(
+            LoadedTheme {
+                data: external,
+                warning: None,
+                source: "theme file".to_owned(),
+            },
+            appearance,
+            false,
+        );
+        assert_eq!(loaded.data.mode, "light");
+        assert_eq!(loaded.data.background, ThemeData::builtin_light().background);
+        assert_eq!(loaded.data.accent, "#123456");
+        assert_eq!(loaded.data.font_size, 15.0);
+    }
+
+    #[test]
+    fn clearing_stale_appearance_mode_preserves_other_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("appearance.json");
+        std::fs::write(&path, r#"{"mode":"dark","opacity":0.8,"fontSize":14}"#).unwrap();
+
+        assert!(clear_appearance_mode(&path).unwrap());
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(document.get("mode").is_none());
+        assert_eq!(document["opacity"], 0.8);
+        assert_eq!(document["fontSize"], 14);
+    }
+
+    #[test]
+    fn only_a_newer_filem_mode_overrides_an_external_mode() {
+        let earlier = std::time::UNIX_EPOCH + Duration::from_secs(10);
+        let later = std::time::UNIX_EPOCH + Duration::from_secs(20);
+        assert!(appearance_mode_is_newer(Some(later), Some(earlier)));
+        assert!(!appearance_mode_is_newer(Some(earlier), Some(later)));
+        assert!(!appearance_mode_is_newer(Some(earlier), Some(earlier)));
+        assert!(!appearance_mode_is_newer(None, Some(earlier)));
     }
 
     #[test]
@@ -1064,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_theme_toggle_persists_until_reload() {
+    fn manual_theme_toggle_persists_across_restarts() {
         let temp = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", temp.path());
@@ -1091,6 +1207,11 @@ mod tests {
         assert_eq!(theme.data.mode, "light");
         assert_eq!(theme.data.opacity, 0.85);
         assert_eq!(theme.data.font_size, 14.0);
+        let mut restarted = Theme::default();
+        restarted.reload();
+        assert_eq!(restarted.data.mode, "light");
+        assert_eq!(restarted.data.opacity, 0.85);
+        assert_eq!(restarted.data.font_size, 14.0);
 
         if let Some(value) = old_home {
             std::env::set_var("HOME", value);

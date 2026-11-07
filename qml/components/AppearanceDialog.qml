@@ -72,6 +72,7 @@ Item {
         close()
         event.accepted = true
     }
+    Keys.priority: Keys.BeforeItem
 
     Rectangle {
         anchors.fill: parent
@@ -375,9 +376,10 @@ Item {
                                 border.color: root.theme ? root.theme.border : "#292e3a"
                             }
                             TextField {
+                                id: tagColorField
                                 objectName: "color_" + modelData.key
                                 Layout.preferredWidth: 110
-                                text: root.colorValue(modelData.key)
+                                Component.onCompleted: text = root.colorValue(modelData.key)
                                 selectByMouse: true
                                 color: root.theme ? root.theme.foreground : "#e7e9ee"
                                 selectionColor: root.theme ? root.theme.selection : "#24364f"
@@ -386,6 +388,13 @@ Item {
                                 font.pixelSize: 12 * (root.theme ? root.theme.font_scale : 1)
                                 Accessible.name: modelData.label + " color"
                                 onEditingFinished: root.saveColor(modelData.key, text)
+                                Connections {
+                                    target: root.theme
+                                    function onChanged() {
+                                        if (!tagColorField.activeFocus)
+                                            tagColorField.text = root.colorValue(modelData.key)
+                                    }
+                                }
                                 background: Rectangle {
                                     radius: 5
                                     color: root.theme ? root.theme.surface_alt : "#1c202a"

@@ -41,17 +41,6 @@ Rectangle {
             elide: Text.ElideRight
         }
 
-        Text {
-            visible: root.backend && root.backend.clipboard_count > 0
-            text: root.backend
-                  ? (root.backend.clipboard_cut ? "\u2702 " : "\u2398 ")
-                    + root.backend.clipboard_count
-                  : ""
-            color: theme ? theme.muted : "#9299a8"
-            font.family: theme ? theme.mono_font : "monospace"
-            font.pixelSize: 10 * (theme ? theme.font_scale : 1)
-        }
-
         Item { Layout.fillWidth: true }
 
         Text {

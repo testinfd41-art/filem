@@ -1,7 +1,8 @@
 //! Real filesystem operations with explicit safety rules.
 //!
 //! Design rules:
-//! - Never follow a symlink while copying, moving, deleting or sizing a tree.
+//! - Follow symlinks only when an MTP destination cannot represent them; guard
+//!   against directory cycles. Other tree operations never follow symlinks.
 //! - Never silently overwrite: replacement first moves the existing entry to the
 //!   trash, which also makes it recoverable by the user.
 //! - Cross-filesystem moves copy first, then remove the source, and report a
@@ -60,9 +61,164 @@ impl ConflictPolicy {
 pub struct TransferOutcome {
     pub created: Vec<PathBuf>,
     pub moves: Vec<(PathBuf, PathBuf)>,
+    pub completed_sources: Vec<PathBuf>,
     pub skipped: Vec<String>,
     pub failed: Vec<(PathBuf, String)>,
     pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemEvent {
+    Started,
+    Completed,
+    Skipped,
+    Cancelled,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct InventoryItem {
+    pub path: PathBuf,
+    pub is_directory: bool,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransferInventory {
+    pub items: Vec<InventoryItem>,
+    pub total_files: usize,
+    pub total_folders: usize,
+    pub total_bytes: u64,
+}
+
+pub fn normalize_transfer_sources(sources: &[PathBuf]) -> Vec<PathBuf> {
+    let mut unique = HashSet::new();
+    let sources = sources
+        .iter()
+        .filter(|path| unique.insert((*path).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected_directories = sources
+        .iter()
+        .filter(|path| {
+            fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    sources
+        .into_iter()
+        .filter(|path| {
+            !path
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| selected_directories.contains(ancestor))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct FileProgress {
+    pub item_index: usize,
+    pub item_count: usize,
+    pub name: String,
+    pub path: PathBuf,
+    pub bytes_done: u64,
+    pub file_bytes: u64,
+}
+
+/// Count a transfer tree without following symbolic links. Retain details only
+/// for a bounded prefix; progress events account for the remainder.
+pub fn transfer_inventory(sources: &[PathBuf]) -> TransferInventory {
+    const MAX_DETAILS: usize = 2_000;
+    fn visit(path: &Path, inventory: &mut TransferInventory) {
+        let metadata = fs::symlink_metadata(path).ok();
+        let file_type = metadata.as_ref().map(|meta| meta.file_type());
+        let is_directory = file_type.is_some_and(|kind| kind.is_dir());
+        let size_bytes = if file_type.is_some_and(|kind| kind.is_file()) {
+            metadata.as_ref().map_or(0, |meta| meta.len())
+        } else {
+            0
+        };
+        if is_directory {
+            inventory.total_folders += 1;
+        } else {
+            inventory.total_files += 1;
+            inventory.total_bytes = inventory.total_bytes.saturating_add(size_bytes);
+        }
+        if inventory.items.len() < MAX_DETAILS {
+            inventory.items.push(InventoryItem {
+                path: path.to_path_buf(),
+                is_directory,
+                size_bytes,
+            });
+        }
+        if !is_directory {
+            return;
+        }
+        if let Ok(read) = fs::read_dir(path) {
+            for entry in read.flatten() {
+                visit(&entry.path(), inventory);
+            }
+        }
+    }
+
+    let mut inventory = TransferInventory::default();
+    for source in sources {
+        visit(source, &mut inventory);
+    }
+    inventory
+}
+
+/// Report descendant entries after an atomic tree operation such as a same
+/// filesystem rename or a move to Trash. Paths in events remain logical source
+/// paths so they match the job inventory.
+pub fn report_tree_entries(
+    disk_root: &Path,
+    logical_root: &Path,
+    result: ItemEvent,
+    events: &mut dyn FnMut(&Path, bool, ItemEvent),
+) {
+    fn visit(
+        disk_path: &Path,
+        logical_path: &Path,
+        result: &ItemEvent,
+        events: &mut dyn FnMut(&Path, bool, ItemEvent),
+    ) {
+        let Ok(meta) = fs::symlink_metadata(disk_path) else {
+            return;
+        };
+        let is_directory = meta.file_type().is_dir();
+        events(logical_path, is_directory, ItemEvent::Started);
+        if is_directory {
+            if let Ok(read) = fs::read_dir(disk_path) {
+                for entry in read.flatten() {
+                    let disk_child = entry.path();
+                    let Some(relative) = disk_child.strip_prefix(disk_path).ok() else {
+                        continue;
+                    };
+                    visit(&disk_child, &logical_path.join(relative), result, events);
+                }
+            }
+        }
+        events(logical_path, is_directory, result.clone());
+    }
+
+    let Ok(meta) = fs::symlink_metadata(disk_root) else {
+        return;
+    };
+    if !meta.file_type().is_dir() {
+        return;
+    }
+    if let Ok(read) = fs::read_dir(disk_root) {
+        for entry in read.flatten() {
+            let disk_child = entry.path();
+            let Some(relative) = disk_child.strip_prefix(disk_root).ok() else {
+                continue;
+            };
+            visit(&disk_child, &logical_root.join(relative), &result, events);
+        }
+    }
 }
 
 /// Validate a single path component entered by the user.
@@ -143,17 +299,349 @@ fn temp_sibling(target: &Path) -> PathBuf {
     ))
 }
 
-/// Stream one regular file to a sibling temporary file, then link it into place
-/// without ever replacing an existing entry. Cancellation removes the partial
-/// data, so a cancelled copy leaves no half-written file behind.
+#[derive(Clone)]
+struct GioDestination {
+    mount_path: PathBuf,
+    mount_root: gio::File,
+}
+
+struct GioMounts {
+    mounts: Vec<GioDestination>,
+}
+
+impl GioMounts {
+    fn current() -> Self {
+        use gio::prelude::*;
+
+        let mounts = gio::VolumeMonitor::get()
+            .mounts()
+            .into_iter()
+            .filter_map(|mount| {
+                let root = mount.root();
+                match root.uri_scheme().as_deref() {
+                    Some("file") | None => return None,
+                    Some(_) => {}
+                }
+                let path = root.path()?;
+                Some(GioDestination {
+                    mount_path: path,
+                    mount_root: root,
+                })
+            })
+            .collect();
+        Self { mounts }
+    }
+
+    fn for_path(&self, path: &Path) -> Option<&GioDestination> {
+        self.mounts
+            .iter()
+            .filter(|mount| path.starts_with(&mount.mount_path))
+            .max_by_key(|mount| mount.mount_path.components().count())
+    }
+}
+
+impl GioDestination {
+    fn file_for(&self, path: &Path) -> Option<gio::File> {
+        use gio::prelude::*;
+
+        let relative = path.strip_prefix(&self.mount_path).ok()?;
+        Some(self.mount_root.resolve_relative_path(relative))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TransferMounts<'a> {
+    source: Option<&'a GioDestination>,
+    destination: Option<&'a GioDestination>,
+}
+
+struct CopyContext<'a> {
+    mounts: TransferMounts<'a>,
+    active_directories: HashSet<(u64, u64)>,
+}
+
+fn cleanup_gio_partial(target: &gio::File, path: &Path, failure: CopyFailure) -> CopyFailure {
+    use gio::prelude::*;
+
+    match target.delete(gio::Cancellable::NONE) {
+        Ok(()) => failure,
+        Err(error) if error.kind::<gio::IOErrorEnum>() == Some(gio::IOErrorEnum::NotFound) => {
+            failure
+        }
+        Err(error) => CopyFailure::Failed(format!(
+            "{}; could not remove partial destination {}: {error}",
+            failure.into_message(),
+            path.display()
+        )),
+    }
+}
+
+fn copy_file_gio(
+    source: &Path,
+    source_gio: Option<&gio::File>,
+    target_path: &Path,
+    target: &gio::File,
+    total: u64,
+    cancel: &AtomicBool,
+    bytes: &mut dyn FnMut(u64, u64),
+) -> Result<(), CopyFailure> {
+    use gio::prelude::*;
+
+    let cancellable = gio::Cancellable::new();
+    let gio_input = source_gio
+        .map(|source| {
+            source.read(Some(&cancellable)).map_err(|error| {
+                CopyFailure::Failed(format!("Could not open {}: {error}", source.uri()))
+            })
+        })
+        .transpose()?;
+    let mut local_input = if source_gio.is_none() {
+        Some(fs::File::open(source).map_err(|error| {
+            CopyFailure::Failed(format!("Could not open {}: {error}", source.display()))
+        })?)
+    } else {
+        None
+    };
+    let output = target
+        .create(gio::FileCreateFlags::NONE, Some(&cancellable))
+        .map_err(|error| {
+            CopyFailure::Failed(
+                if error.kind::<gio::IOErrorEnum>() == Some(gio::IOErrorEnum::Exists) {
+                    format!(
+                        "{} already exists; nothing was overwritten.",
+                        target_path.display()
+                    )
+                } else {
+                    format!("Could not create {}: {error}", target_path.display())
+                },
+            )
+        })?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut done = 0u64;
+    let result = loop {
+        if cancel.load(Ordering::Relaxed) {
+            cancellable.cancel();
+            break Err(CopyFailure::Cancelled);
+        }
+        let read = if let Some(input) = gio_input.as_ref() {
+            input
+                .read(&mut buffer, Some(&cancellable))
+                .map_err(|error| error.to_string())
+        } else {
+            local_input
+                .as_mut()
+                .expect("local source stream exists when no GIO source is used")
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())
+        };
+        let read = match read {
+            Ok(read) => read,
+            Err(error) => {
+                break Err(CopyFailure::Failed(format!(
+                    "Could not read {}: {error}",
+                    source.display()
+                )))
+            }
+        };
+        if read == 0 {
+            break Ok(());
+        }
+        match output.write_all(&buffer[..read], Some(&cancellable)) {
+            Ok((written, None)) => {
+                done = done.saturating_add(written as u64);
+                bytes(done, total);
+            }
+            Ok((written, Some(error))) => {
+                done = done.saturating_add(written as u64);
+                bytes(done, total);
+                break Err(if cancel.load(Ordering::Relaxed) {
+                    CopyFailure::Cancelled
+                } else {
+                    CopyFailure::Failed(format!(
+                        "Could not write {}: {error}",
+                        target_path.display()
+                    ))
+                });
+            }
+            Err(error) => {
+                break Err(if cancel.load(Ordering::Relaxed) {
+                    CopyFailure::Cancelled
+                } else {
+                    CopyFailure::Failed(format!(
+                        "Could not write {}: {error}",
+                        target_path.display()
+                    ))
+                });
+            }
+        }
+    };
+
+    let input_close_result = gio_input
+        .as_ref()
+        .map(|input| input.close(gio::Cancellable::NONE))
+        .transpose();
+    let close_result = output.close(gio::Cancellable::NONE);
+    match (result, input_close_result, close_result) {
+        (Ok(()), Ok(_), Ok(())) => Ok(()),
+        (Ok(()), Err(error), _) => Err(cleanup_gio_partial(
+            target,
+            target_path,
+            CopyFailure::Failed(format!(
+                "Could not close source {}: {error}",
+                source.display()
+            )),
+        )),
+        (Ok(()), _, Err(error)) => Err(cleanup_gio_partial(
+            target,
+            target_path,
+            CopyFailure::Failed(format!(
+                "Could not finish writing {}: {error}",
+                target_path.display()
+            )),
+        )),
+        (Err(failure), _, _) => Err(cleanup_gio_partial(target, target_path, failure)),
+    }
+}
+
+fn commit_local_temp(
+    temp: &Path,
+    target: &Path,
+    mode: u32,
+    output: fs::File,
+) -> Result<(), CopyFailure> {
+    if let Err(error) = output.sync_all() {
+        let _ = fs::remove_file(temp);
+        return Err(CopyFailure::Failed(format!(
+            "Could not flush {}: {error}",
+            temp.display()
+        )));
+    }
+    drop(output);
+    let _ = fs::set_permissions(temp, fs::Permissions::from_mode(mode & 0o777));
+    match fs::hard_link(temp, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(temp);
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(temp);
+            Err(CopyFailure::Failed(format!(
+                "{} already exists; nothing was overwritten.",
+                target.display()
+            )))
+        }
+        Err(_) => {
+            if target.exists() {
+                let _ = fs::remove_file(temp);
+                return Err(CopyFailure::Failed(format!(
+                    "{} already exists; nothing was overwritten.",
+                    target.display()
+                )));
+            }
+            match rename_noreplace(temp, target) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = fs::remove_file(temp);
+                    Err(CopyFailure::Failed(format!(
+                        "Could not create {}: {error}",
+                        target.display()
+                    )))
+                }
+            }
+        }
+    }
+}
+
+fn copy_file_gio_source_to_local(
+    source: &gio::File,
+    source_path: &Path,
+    target: &Path,
+    mode: u32,
+    total: u64,
+    cancel: &AtomicBool,
+    bytes: &mut dyn FnMut(u64, u64),
+) -> Result<(), CopyFailure> {
+    use gio::prelude::*;
+
+    let temp = temp_sibling(target);
+    let temp_file = gio::File::for_path(&temp);
+    let cancellable = gio::Cancellable::new();
+    let result = source.copy(
+        &temp_file,
+        gio::FileCopyFlags::NONE,
+        Some(&cancellable),
+        Some(&mut |done, file_total| {
+            if cancel.load(Ordering::Relaxed) {
+                cancellable.cancel();
+            }
+            bytes(
+                done as u64,
+                if file_total > 0 {
+                    file_total as u64
+                } else {
+                    total
+                },
+            );
+        }),
+    );
+    if let Err(error) = result {
+        let cleanup = fs::remove_file(&temp);
+        if let Err(cleanup_error) = cleanup {
+            if cleanup_error.kind() != io::ErrorKind::NotFound {
+                return Err(CopyFailure::Failed(format!(
+                    "Could not copy {}: {error}; could not remove temporary file {}: {cleanup_error}",
+                    source_path.display(),
+                    temp.display()
+                )));
+            }
+        }
+        return Err(if cancel.load(Ordering::Relaxed) {
+            CopyFailure::Cancelled
+        } else {
+            CopyFailure::Failed(format!("Could not copy {}: {error}", source_path.display()))
+        });
+    }
+    if cancel.load(Ordering::Relaxed) {
+        let _ = fs::remove_file(&temp);
+        return Err(CopyFailure::Cancelled);
+    }
+    let output = match fs::OpenOptions::new().write(true).open(&temp) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(CopyFailure::Failed(format!(
+                "Could not open {}: {error}",
+                temp.display()
+            )));
+        }
+    };
+    commit_local_temp(&temp, target, mode, output)
+}
+
+/// Stream to a native GVfs destination when its mount is identified; all other
+/// destinations retain the atomic local temporary-file commit path. A native
+/// GVfs source copied to a local destination is read through GIO into that
+/// same atomic temporary-file path.
 fn copy_file_streaming(
     source: &Path,
     target: &Path,
     mode: u32,
     cancel: &AtomicBool,
+    gio_source: Option<&gio::File>,
+    gio_target: Option<&gio::File>,
     bytes: &mut dyn FnMut(u64, u64),
 ) -> Result<(), CopyFailure> {
     let total = fs::metadata(source).map(|meta| meta.len()).unwrap_or(0);
+
+    if let Some(gio_target) = gio_target {
+        return copy_file_gio(source, gio_source, target, gio_target, total, cancel, bytes);
+    }
+    if let Some(gio_source) = gio_source {
+        return copy_file_gio_source_to_local(
+            gio_source, source, target, mode, total, cancel, bytes,
+        );
+    }
+
     let temp = temp_sibling(target);
     let mut input = fs::File::open(source).map_err(|error| {
         CopyFailure::Failed(format!("Could not open {}: {error}", source.display()))
@@ -165,7 +653,7 @@ fn copy_file_streaming(
         .map_err(|error| {
             CopyFailure::Failed(format!("Could not create {}: {error}", temp.display()))
         })?;
-    let mut buffer = vec![0u8; 256 * 1024];
+    let mut buffer = vec![0u8; 1024 * 1024];
     let mut done = 0u64;
     let result = loop {
         if cancel.load(Ordering::Relaxed) {
@@ -196,67 +684,128 @@ fn copy_file_streaming(
         let _ = fs::remove_file(&temp);
         return Err(failure);
     }
-    if let Err(error) = output.sync_all() {
-        let _ = fs::remove_file(&temp);
-        return Err(CopyFailure::Failed(format!(
-            "Could not flush {}: {error}",
-            temp.display()
-        )));
-    }
-    drop(output);
-    let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(mode & 0o777));
-    // A hard link fails when the target already exists, which is exactly the
-    // no-silent-overwrite guarantee we want. Filesystems without hard links
-    // fall back to a checked rename.
-    match fs::hard_link(&temp, target) {
-        Ok(()) => {
-            let _ = fs::remove_file(&temp);
-            Ok(())
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&temp);
-            Err(CopyFailure::Failed(format!(
-                "{} already exists; nothing was overwritten.",
-                target.display()
-            )))
-        }
-        Err(_) => {
-            if target.exists() {
-                let _ = fs::remove_file(&temp);
-                return Err(CopyFailure::Failed(format!(
-                    "{} already exists; nothing was overwritten.",
-                    target.display()
-                )));
-            }
-            match rename_noreplace(&temp, target) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    let _ = fs::remove_file(&temp);
-                    Err(CopyFailure::Failed(format!(
-                        "Could not create {}: {error}",
-                        target.display()
-                    )))
-                }
-            }
-        }
-    }
+    commit_local_temp(&temp, target, mode, output)
 }
 
-fn copy_entry(
+fn copy_entry_with_destination(
     source: &Path,
     target: &Path,
     cancel: &AtomicBool,
-    bytes: &mut dyn FnMut(u64, u64),
+    bytes: &mut dyn FnMut(&Path, u64, u64),
+    events: &mut dyn FnMut(&Path, bool, ItemEvent),
+    context: &mut CopyContext<'_>,
 ) -> Result<(), CopyFailure> {
-    let meta = fs::symlink_metadata(source).map_err(|error| {
-        CopyFailure::Failed(format!("Could not inspect {}: {error}", source.display()))
-    })?;
+    use gio::prelude::*;
+
+    let link_meta = match fs::symlink_metadata(source) {
+        Ok(meta) => meta,
+        Err(error) => {
+            events(
+                source,
+                false,
+                ItemEvent::Failed(format!("Could not inspect {}: {error}", source.display())),
+            );
+            return Err(CopyFailure::Failed(format!(
+                "Could not inspect {}: {error}",
+                source.display()
+            )));
+        }
+    };
+    let dereference_for_mtp = link_meta.file_type().is_symlink()
+        && context
+            .mounts
+            .destination
+            .and_then(|mount| mount.file_for(target))
+            .and_then(|file| file.uri_scheme())
+            .as_deref()
+            == Some("mtp");
+    let meta = if dereference_for_mtp {
+        fs::metadata(source)
+    } else {
+        Ok(link_meta)
+    };
+    let is_directory = meta
+        .as_ref()
+        .is_ok_and(|metadata| metadata.file_type().is_dir());
+    events(source, is_directory, ItemEvent::Started);
+    let meta = match meta {
+        Ok(meta) => meta,
+        Err(error) => {
+            if dereference_for_mtp {
+                let message = format!(
+                    "Could not follow symbolic link {} for the Android destination: {error}",
+                    source.display()
+                );
+                events(source, is_directory, ItemEvent::Failed(message.clone()));
+                return Err(CopyFailure::Failed(message));
+            } else {
+                let message = format!("Could not inspect {}: {error}", source.display());
+                events(source, is_directory, ItemEvent::Failed(message.clone()));
+                return Err(CopyFailure::Failed(message));
+            }
+        }
+    };
+    let result = copy_entry_inner(source, target, cancel, bytes, events, meta, context);
+    match &result {
+        Ok(()) => events(source, is_directory, ItemEvent::Completed),
+        Err(CopyFailure::Cancelled) => events(source, is_directory, ItemEvent::Cancelled),
+        Err(CopyFailure::Failed(error)) => {
+            events(source, is_directory, ItemEvent::Failed(error.clone()))
+        }
+    }
+    result
+}
+
+fn cleanup_partial_directory(target: &Path, failure: CopyFailure) -> CopyFailure {
+    match fs::remove_dir_all(target) {
+        Ok(()) => failure,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => failure,
+        Err(error) => CopyFailure::Failed(format!(
+            "{}; could not remove partial destination {}: {error}",
+            failure.into_message(),
+            target.display()
+        )),
+    }
+}
+
+fn copy_entry_inner(
+    source: &Path,
+    target: &Path,
+    cancel: &AtomicBool,
+    bytes: &mut dyn FnMut(&Path, u64, u64),
+    events: &mut dyn FnMut(&Path, bool, ItemEvent),
+    meta: fs::Metadata,
+    context: &mut CopyContext<'_>,
+) -> Result<(), CopyFailure> {
     let file_type = meta.file_type();
+    let gio_source = context
+        .mounts
+        .source
+        .and_then(|mount| mount.file_for(source));
+    let gio_target = context
+        .mounts
+        .destination
+        .and_then(|destination| destination.file_for(target));
 
     if file_type.is_symlink() {
         let link = fs::read_link(source).map_err(|error| {
             CopyFailure::Failed(format!("Could not read link {}: {error}", source.display()))
         })?;
+        if let Some(gio_target) = gio_target {
+            use gio::prelude::*;
+            match gio_target.make_symbolic_link(&link, gio::Cancellable::NONE) {
+                Ok(()) => return Ok(()),
+                Err(gio_error) => {
+                    std::os::unix::fs::symlink(link, target).map_err(|error| {
+                        CopyFailure::Failed(format!(
+                            "Could not create symbolic link {} through GIO ({gio_error}) or GVfs ({error}).",
+                            target.display()
+                        ))
+                    })?;
+                    return Ok(());
+                }
+            }
+        }
         std::os::unix::fs::symlink(link, target).map_err(|error| {
             CopyFailure::Failed(format!(
                 "Could not create link {}: {error}",
@@ -267,35 +816,84 @@ fn copy_entry(
     }
 
     if file_type.is_dir() {
-        fs::create_dir(target).map_err(|error| {
-            CopyFailure::Failed(format!("Could not create {}: {error}", target.display()))
-        })?;
-        // Best effort: keep the mode, but never copy setuid/setgid bits.
-        let mode = meta.permissions().mode() & 0o777;
-        let _ = fs::set_permissions(target, fs::Permissions::from_mode(mode));
-        let read = fs::read_dir(source).map_err(|error| {
-            CopyFailure::Failed(format!("Could not read {}: {error}", source.display()))
-        })?;
-        for item in read {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = fs::remove_dir_all(target);
-                return Err(CopyFailure::Cancelled);
-            }
-            let item = item.map_err(|error| {
-                CopyFailure::Failed(format!("Could not read {}: {error}", source.display()))
-            })?;
-            let name = item.file_name();
-            // Everything removed here was created by this copy, never by the user.
-            if let Err(failure) = copy_entry(&item.path(), &target.join(name), cancel, bytes) {
-                let _ = fs::remove_dir_all(target);
-                return Err(failure);
-            }
+        let identity = (meta.dev(), meta.ino());
+        if !context.active_directories.insert(identity) {
+            return Err(CopyFailure::Failed(format!(
+                "Refusing to follow a symbolic-link loop while copying {}.",
+                source.display()
+            )));
         }
-        return Ok(());
+        let result = (|| {
+            if let Some(gio_target) = gio_target.as_ref() {
+                use gio::prelude::*;
+                gio_target
+                    .make_directory(gio::Cancellable::NONE)
+                    .map_err(|error| {
+                        CopyFailure::Failed(format!(
+                            "Could not create {}: {error}",
+                            target.display()
+                        ))
+                    })?;
+            } else {
+                fs::create_dir(target).map_err(|error| {
+                    CopyFailure::Failed(format!("Could not create {}: {error}", target.display()))
+                })?;
+                let mode = meta.permissions().mode() & 0o777;
+                let _ = fs::set_permissions(target, fs::Permissions::from_mode(mode));
+            }
+            let read = match fs::read_dir(source) {
+                Ok(read) => read,
+                Err(error) => {
+                    return Err(cleanup_partial_directory(
+                        target,
+                        CopyFailure::Failed(format!("Could not read {}: {error}", source.display())),
+                    ))
+                }
+            };
+            for item in read {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(cleanup_partial_directory(target, CopyFailure::Cancelled));
+                }
+                let item = match item {
+                    Ok(item) => item,
+                    Err(error) => {
+                        return Err(cleanup_partial_directory(
+                            target,
+                            CopyFailure::Failed(format!(
+                                "Could not read {}: {error}",
+                                source.display()
+                            )),
+                        ))
+                    }
+                };
+                let name = item.file_name();
+                if let Err(failure) = copy_entry_with_destination(
+                    &item.path(),
+                    &target.join(name),
+                    cancel,
+                    bytes,
+                    events,
+                    context,
+                ) {
+                    return Err(cleanup_partial_directory(target, failure));
+                }
+            }
+            Ok(())
+        })();
+        context.active_directories.remove(&identity);
+        return result;
     }
 
     if file_type.is_file() {
-        return copy_file_streaming(source, target, meta.permissions().mode(), cancel, bytes);
+        return copy_file_streaming(
+            source,
+            target,
+            meta.permissions().mode(),
+            cancel,
+            gio_source.as_ref(),
+            gio_target.as_ref(),
+            &mut |done, total| bytes(source, done, total),
+        );
     }
 
     Err(CopyFailure::Failed(format!(
@@ -304,11 +902,27 @@ fn copy_entry(
     )))
 }
 
-/// Copy one entry. Directories are copied recursively, symlinks are recreated
-/// as links and never followed, and the destination must not already exist.
+/// Copy one entry without replacing an existing destination.
 pub fn copy_one(source: &Path, target: &Path) -> Result<(), String> {
     let cancel = AtomicBool::new(false);
-    copy_entry(source, target, &cancel, &mut |_, _| {}).map_err(CopyFailure::into_message)
+    let available_mounts = GioMounts::current();
+    let mounts = TransferMounts {
+        source: available_mounts.for_path(source),
+        destination: available_mounts.for_path(target),
+    };
+    let mut context = CopyContext {
+        mounts,
+        active_directories: HashSet::new(),
+    };
+    copy_entry_with_destination(
+        source,
+        target,
+        &cancel,
+        &mut |_, _, _| {},
+        &mut |_, _, _| {},
+        &mut context,
+    )
+    .map_err(CopyFailure::into_message)
 }
 
 fn is_cross_device(error: &io::Error) -> bool {
@@ -319,12 +933,24 @@ fn move_entry(
     source: &Path,
     target: &Path,
     cancel: &AtomicBool,
-    bytes: &mut dyn FnMut(u64, u64),
+    bytes: &mut dyn FnMut(&Path, u64, u64),
+    events: &mut dyn FnMut(&Path, bool, ItemEvent),
+    report_descendants: bool,
+    context: &mut CopyContext<'_>,
 ) -> Result<(), CopyFailure> {
-    match rename_noreplace(source, target) {
-        Ok(()) => Ok(()),
+    let is_directory = fs::symlink_metadata(source)
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false);
+    events(source, is_directory, ItemEvent::Started);
+    let result = match rename_noreplace(source, target) {
+        Ok(()) => {
+            if report_descendants {
+                report_tree_entries(target, source, ItemEvent::Completed, events);
+            }
+            Ok(())
+        }
         Err(error) if is_cross_device(&error) => {
-            copy_entry(source, target, cancel, bytes)?;
+            copy_entry_with_destination(source, target, cancel, bytes, events, context)?;
             remove_tree(source).map_err(|remove| {
                 CopyFailure::Failed(format!(
                     "{source} was copied to {target}, but the original could not be removed: {remove}",
@@ -339,13 +965,39 @@ fn move_entry(
             source.display(),
             target.display()
         ))),
+    };
+    match &result {
+        Ok(()) => events(source, is_directory, ItemEvent::Completed),
+        Err(CopyFailure::Cancelled) => events(source, is_directory, ItemEvent::Cancelled),
+        Err(CopyFailure::Failed(error)) => {
+            events(source, is_directory, ItemEvent::Failed(error.clone()))
+        }
     }
+    result
 }
 
 /// Move one entry, falling back to copy-then-delete across filesystems.
 pub fn move_one(source: &Path, target: &Path) -> Result<(), String> {
     let cancel = AtomicBool::new(false);
-    move_entry(source, target, &cancel, &mut |_, _| {}).map_err(CopyFailure::into_message)
+    let available_mounts = GioMounts::current();
+    let mounts = TransferMounts {
+        source: available_mounts.for_path(source),
+        destination: available_mounts.for_path(target),
+    };
+    let mut context = CopyContext {
+        mounts,
+        active_directories: HashSet::new(),
+    };
+    move_entry(
+        source,
+        target,
+        &cancel,
+        &mut |_, _, _| {},
+        &mut |_, _, _| {},
+        false,
+        &mut context,
+    )
+    .map_err(CopyFailure::into_message)
 }
 
 fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
@@ -542,6 +1194,93 @@ pub fn remove_tree(path: &Path) -> Result<(), String> {
     result.map_err(|error| format!("Could not delete {}: {error}", path.display()))
 }
 
+/// Permanently delete a tree while reporting each visited entry and honoring
+/// cancellation between filesystem operations.
+pub fn remove_tree_detailed(
+    path: &Path,
+    cancel: &AtomicBool,
+    events: &mut dyn FnMut(&Path, bool, ItemEvent),
+) -> Result<bool, String> {
+    fn remove(
+        path: &Path,
+        cancel: &AtomicBool,
+        events: &mut dyn FnMut(&Path, bool, ItemEvent),
+    ) -> Result<bool, String> {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(error) => {
+                let message = format!("Could not inspect {}: {error}", path.display());
+                events(path, false, ItemEvent::Failed(message.clone()));
+                return Err(message);
+            }
+        };
+        let is_directory = meta.file_type().is_dir();
+        events(path, is_directory, ItemEvent::Started);
+        if cancel.load(Ordering::Relaxed) {
+            events(path, is_directory, ItemEvent::Cancelled);
+            return Ok(false);
+        }
+
+        if is_directory {
+            let read = match fs::read_dir(path) {
+                Ok(read) => read,
+                Err(error) => {
+                    let message = format!("Could not read {}: {error}", path.display());
+                    events(path, true, ItemEvent::Failed(message.clone()));
+                    return Err(message);
+                }
+            };
+            let mut children = read
+                .map(|entry| {
+                    entry
+                        .map(|entry| entry.path())
+                        .map_err(|error| format!("Could not read {}: {error}", path.display()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            children.sort();
+            let mut errors = Vec::new();
+            for child in children {
+                if cancel.load(Ordering::Relaxed) {
+                    events(path, true, ItemEvent::Cancelled);
+                    return Ok(false);
+                }
+                match remove(&child, cancel, events) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        events(path, true, ItemEvent::Cancelled);
+                        return Ok(false);
+                    }
+                    Err(error) => errors.push(error),
+                }
+            }
+            if !errors.is_empty() {
+                let error = errors.join("; ");
+                events(path, true, ItemEvent::Failed(error.clone()));
+                return Err(error);
+            }
+        }
+
+        let result = if is_directory {
+            fs::remove_dir(path)
+        } else {
+            fs::remove_file(path)
+        };
+        match result {
+            Ok(()) => {
+                events(path, is_directory, ItemEvent::Completed);
+                Ok(true)
+            }
+            Err(error) => {
+                let message = format!("Could not delete {}: {error}", path.display());
+                events(path, is_directory, ItemEvent::Failed(message.clone()));
+                Err(message)
+            }
+        }
+    }
+
+    remove(path, cancel, events)
+}
+
 fn transfer_conflict(
     source: &Path,
     target: &Path,
@@ -583,9 +1322,41 @@ pub fn transfer(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize, usize, &str, u64, u64),
 ) -> TransferOutcome {
+    let mut events = |_: &Path, _: bool, _: ItemEvent| {};
+    let mut detailed_progress = |file: FileProgress| {
+        progress(
+            file.item_index,
+            file.item_count,
+            &file.name,
+            file.bytes_done,
+            file.file_bytes,
+        );
+    };
+    transfer_with_events(
+        sources,
+        dest_dir,
+        cut,
+        policy,
+        cancel,
+        &mut events,
+        &mut detailed_progress,
+    )
+}
+
+/// Transfer a selection while reporting per-entry state and current-file bytes.
+pub fn transfer_with_events(
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    cut: bool,
+    policy: ConflictPolicy,
+    cancel: &AtomicBool,
+    events: &mut dyn FnMut(&Path, bool, ItemEvent),
+    progress: &mut dyn FnMut(FileProgress),
+) -> TransferOutcome {
     let mut outcome = TransferOutcome {
         created: Vec::new(),
         moves: Vec::new(),
+        completed_sources: Vec::new(),
         skipped: Vec::new(),
         failed: Vec::new(),
         cancelled: false,
@@ -600,6 +1371,8 @@ pub fn transfer(
         return outcome;
     }
 
+    let gio_mounts = GioMounts::current();
+    let destination = gio_mounts.for_path(dest_dir);
     for (index, source) in sources.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             outcome.cancelled = true;
@@ -609,21 +1382,36 @@ pub fn transfer(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| source.display().to_string());
-        progress(index, total, &name, 0, 0);
+        progress(FileProgress {
+            item_index: index,
+            item_count: total,
+            name: name.clone(),
+            path: source.clone(),
+            bytes_done: 0,
+            file_bytes: 0,
+        });
 
-        let Ok(meta) = fs::symlink_metadata(source) else {
-            outcome.failed.push((
-                source.clone(),
-                format!("{} no longer exists.", source.display()),
-            ));
-            continue;
+        let meta = match fs::symlink_metadata(source) {
+            Ok(meta) => meta,
+            Err(error) => {
+                let message = format!("Could not inspect {}: {error}", source.display());
+                events(source, false, ItemEvent::Failed(message.clone()));
+                outcome.failed.push((source.clone(), message));
+                continue;
+            }
         };
+        let is_directory = meta.file_type().is_dir();
 
         // Refuse to copy or move a folder into itself or a descendant.
-        if meta.is_dir() {
+        if is_directory {
             let source_clean = crate::paths::clean_lexically(source);
             let dest_clean = crate::paths::clean_lexically(dest_dir);
             if dest_clean == source_clean || dest_clean.starts_with(&source_clean) {
+                events(
+                    source,
+                    true,
+                    ItemEvent::Failed("Cannot copy or move a folder inside itself.".into()),
+                );
                 outcome.failed.push((
                     source.clone(),
                     "Cannot copy or move a folder inside itself.".to_owned(),
@@ -635,6 +1423,7 @@ pub fn transfer(
         let name_os = match source_name(source) {
             Ok(name) => name.to_owned(),
             Err(error) => {
+                events(source, is_directory, ItemEvent::Failed(error.clone()));
                 outcome.failed.push((source.clone(), error));
                 continue;
             }
@@ -642,6 +1431,11 @@ pub fn transfer(
         let target = dest_dir.join(&name_os);
 
         if target == *source {
+            if is_directory {
+                report_tree_entries(source, source, ItemEvent::Skipped, events);
+            }
+            events(source, is_directory, ItemEvent::Skipped);
+            outcome.completed_sources.push(source.clone());
             outcome
                 .skipped
                 .push(format!("{name}: already in this folder"));
@@ -652,27 +1446,63 @@ pub fn transfer(
             Ok(Some(target)) => target,
             Ok(None) => {
                 if target.exists() {
+                    if is_directory {
+                        report_tree_entries(source, source, ItemEvent::Skipped, events);
+                    }
+                    events(source, is_directory, ItemEvent::Skipped);
                     outcome.skipped.push(name);
                 }
                 continue;
             }
             Err(error) => {
+                events(source, is_directory, ItemEvent::Failed(error.clone()));
                 outcome.failed.push((source.clone(), error));
                 continue;
             }
         };
 
-        let mut on_bytes = |done: u64, file_total: u64| {
-            progress(index, total, &name, done, file_total);
+        let mut on_bytes = |path: &Path, done: u64, file_total: u64| {
+            progress(FileProgress {
+                item_index: index,
+                item_count: total,
+                name: name.clone(),
+                path: path.to_path_buf(),
+                bytes_done: done,
+                file_bytes: file_total,
+            });
+        };
+        let mounts = TransferMounts {
+            source: gio_mounts.for_path(source),
+            destination,
+        };
+        let mut context = CopyContext {
+            mounts,
+            active_directories: HashSet::new(),
         };
         let result = if cut {
-            move_entry(source, &target, cancel, &mut on_bytes)
+            move_entry(
+                source,
+                &target,
+                cancel,
+                &mut on_bytes,
+                events,
+                true,
+                &mut context,
+            )
         } else {
-            copy_entry(source, &target, cancel, &mut on_bytes)
+            copy_entry_with_destination(
+                source,
+                &target,
+                cancel,
+                &mut on_bytes,
+                events,
+                &mut context,
+            )
         };
 
         match result {
             Ok(()) => {
+                outcome.completed_sources.push(source.clone());
                 if cut {
                     outcome.moves.push((source.clone(), target));
                 } else {
@@ -687,7 +1517,14 @@ pub fn transfer(
         }
     }
 
-    progress(total, total, "", 0, 0);
+    progress(FileProgress {
+        item_index: total,
+        item_count: total,
+        name: String::new(),
+        path: PathBuf::new(),
+        bytes_done: 0,
+        file_bytes: 0,
+    });
     outcome
 }
 
@@ -868,6 +1705,13 @@ fn parse_trashinfo(text: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+pub fn trash_original_for(dir: &Path, name: &str) -> Option<PathBuf> {
+    let info_path = dir.join("info").join(format!("{name}.trashinfo"));
+    fs::read_to_string(info_path)
+        .ok()
+        .and_then(|text| parse_trashinfo(&text))
 }
 
 fn percent_decode(value: &str) -> Option<String> {
@@ -2420,6 +3264,348 @@ mod tests {
     }
 
     #[test]
+    fn gvfs_looking_path_without_a_gio_mount_keeps_safe_copy_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let gvfs_dir = dir.path().join("gvfs").join("mtp:host=device");
+        fs::create_dir_all(&gvfs_dir).unwrap();
+        let source = dir.path().join("source.txt");
+        let target = gvfs_dir.join("destination.txt");
+        write_file(&source, "streamed content");
+
+        assert!(copy_one(&source, &target).is_ok());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "streamed content");
+
+        assert!(copy_one(&source, &target).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "streamed content");
+    }
+
+    #[test]
+    fn gvfs_looking_path_without_a_gio_mount_cleans_cancelled_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let gvfs_dir = dir.path().join("gvfs").join("mtp:host=device");
+        fs::create_dir_all(&gvfs_dir).unwrap();
+        let source = dir.path().join("source.bin");
+        let target = gvfs_dir.join("source.bin");
+        fs::write(&source, vec![7u8; 4 * 1024 * 1024]).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let mut observed = false;
+        let outcome = transfer_with_events(
+            std::slice::from_ref(&source),
+            &gvfs_dir,
+            false,
+            ConflictPolicy::Skip,
+            &cancel,
+            &mut |_, _, _| {},
+            &mut |progress| {
+                if progress.bytes_done > 0 && !observed {
+                    observed = true;
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert!(outcome.cancelled);
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn gio_destination_resolves_relative_paths_against_remote_mount_uri() {
+        use gio::prelude::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mount_path = dir.path().join("mtp:host=device");
+        let mount_root = gio::File::for_uri("mtp://SERIAL/");
+        let destination = GioDestination {
+            mount_path: mount_path.clone(),
+            mount_root,
+        };
+        let target = destination
+            .file_for(&mount_path.join("DCIM").join("picture.jpg"))
+            .unwrap();
+        assert_eq!(target.uri().as_str(), "mtp://SERIAL/DCIM/picture.jpg");
+        assert!(destination
+            .file_for(&dir.path().join("unrelated"))
+            .is_none());
+    }
+
+    #[test]
+    fn gio_stream_is_exclusive_and_cleans_cancelled_partial_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let target_path = dir.path().join("target.bin");
+        fs::write(&source, vec![7u8; 3 * 1024 * 1024]).unwrap();
+        let target = gio::File::for_path(&target_path);
+        let gio_source = gio::File::for_path(&source);
+
+        let cancel = AtomicBool::new(false);
+        let mut last_done = 0;
+        copy_file_gio(
+            &source,
+            Some(&gio_source),
+            &target_path,
+            &target,
+            3 * 1024 * 1024,
+            &cancel,
+            &mut |done, _| {
+                last_done = done;
+            },
+        )
+        .unwrap();
+        assert_eq!(last_done, 3 * 1024 * 1024);
+        assert_eq!(fs::read(&target_path).unwrap(), fs::read(&source).unwrap());
+
+        fs::write(&target_path, b"keep existing").unwrap();
+        assert!(copy_file_gio(
+            &source,
+            None,
+            &target_path,
+            &target,
+            3 * 1024 * 1024,
+            &cancel,
+            &mut |_, _| {},
+        )
+        .is_err());
+        assert_eq!(fs::read(&target_path).unwrap(), b"keep existing");
+
+        let cancelled_path = dir.path().join("cancelled.bin");
+        let cancelled_target = gio::File::for_path(&cancelled_path);
+        let cancel = AtomicBool::new(false);
+        let result = copy_file_gio(
+            &source,
+            None,
+            &cancelled_path,
+            &cancelled_target,
+            3 * 1024 * 1024,
+            &cancel,
+            &mut |done, _| {
+                if done > 0 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert!(matches!(result, Err(CopyFailure::Cancelled)));
+        assert!(!cancelled_path.exists());
+    }
+
+    #[test]
+    fn gio_source_to_local_copy_uses_atomic_commit_and_preserves_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("remote-source.bin");
+        let target_path = dir.path().join("local-target.bin");
+        let contents = vec![5u8; 2 * 1024 * 1024];
+        fs::write(&source, &contents).unwrap();
+        let source_gio = gio::File::for_path(&source);
+        let cancel = AtomicBool::new(false);
+
+        copy_file_gio_source_to_local(
+            &source_gio,
+            &source,
+            &target_path,
+            0o644,
+            contents.len() as u64,
+            &cancel,
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(fs::read(&target_path).unwrap(), contents);
+
+        fs::write(&target_path, b"preserve").unwrap();
+        assert!(copy_file_gio_source_to_local(
+            &source_gio,
+            &source,
+            &target_path,
+            0o644,
+            contents.len() as u64,
+            &cancel,
+            &mut |_, _| {},
+        )
+        .is_err());
+        assert_eq!(fs::read(&target_path).unwrap(), b"preserve");
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".filem-part-"))
+                .count(),
+            0
+        );
+    }
+
+    struct MtpTestDirectory {
+        mount: GioDestination,
+        path: PathBuf,
+        files: Vec<String>,
+        cleaned: bool,
+    }
+
+    impl MtpTestDirectory {
+        fn cleanup(&mut self) -> Result<(), String> {
+            use gio::prelude::*;
+
+            for name in &self.files {
+                let file = self.mount.file_for(&self.path.join(name)).ok_or_else(|| {
+                    format!(
+                        "Could not resolve MTP test file {}.",
+                        self.path.join(name).display()
+                    )
+                })?;
+                if let Err(error) = file.delete(gio::Cancellable::NONE) {
+                    if error.kind::<gio::IOErrorEnum>() != Some(gio::IOErrorEnum::NotFound) {
+                        return Err(format!("Could not remove MTP test file: {error}"));
+                    }
+                }
+            }
+            let directory = self
+                .mount
+                .file_for(&self.path)
+                .ok_or_else(|| "Could not resolve the MTP test directory.".to_owned())?;
+            if let Err(error) = directory.delete(gio::Cancellable::NONE) {
+                if error.kind::<gio::IOErrorEnum>() != Some(gio::IOErrorEnum::NotFound) {
+                    return Err(format!("Could not remove MTP test directory: {error}"));
+                }
+            }
+            self.cleaned = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for MtpTestDirectory {
+        fn drop(&mut self) {
+            if !self.cleaned {
+                let _ = self.cleanup();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires FILEM_MTP_TEST_ROOT and a connected, unlocked Android device"]
+    fn mtp_copy_round_trip_conflict_and_cancellation_are_confined_to_test_directory() {
+        use gio::prelude::*;
+
+        let root = PathBuf::from(
+            std::env::var_os("FILEM_MTP_TEST_ROOT")
+                .expect("set FILEM_MTP_TEST_ROOT to the mounted Android storage root"),
+        );
+        let mount = GioMounts::current()
+            .for_path(&root)
+            .expect("Android GVfs mount is available")
+            .clone();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let test_dir = root.join(format!(
+            ".filem-transfer-test-{}-{nonce}",
+            std::process::id()
+        ));
+        assert!(!test_dir.exists(), "test directory must not pre-exist");
+        mount
+            .file_for(&test_dir)
+            .expect("test directory resolves through GIO")
+            .make_directory(gio::Cancellable::NONE)
+            .expect("create isolated test directory");
+        let mut artifacts = MtpTestDirectory {
+            mount,
+            path: test_dir.clone(),
+            files: vec![
+                "linked-dir/nested.bin".to_owned(),
+                "linked-dir".to_owned(),
+                "round-trip.bin".to_owned(),
+                "round-trip-link".to_owned(),
+                "existing.bin".to_owned(),
+                "cancel-source.bin".to_owned(),
+            ],
+            cleaned: false,
+        };
+
+        let local = tempfile::tempdir().unwrap();
+        let source = local.path().join("round-trip.bin");
+        let contents = (0..4 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&source, &contents).unwrap();
+        let phone_file = test_dir.join("round-trip.bin");
+        copy_one(&source, &phone_file).expect("copy local file to Android using GIO");
+        assert_eq!(fs::read(&phone_file).unwrap(), contents);
+
+        let local_copy = local.path().join("phone-copy.bin");
+        copy_one(&phone_file, &local_copy).expect("copy Android file to local atomic destination");
+        assert_eq!(fs::read(&local_copy).unwrap(), contents);
+
+        let symlink_source = local.path().join("round-trip-link");
+        std::os::unix::fs::symlink("round-trip.bin", &symlink_source).unwrap();
+        let phone_symlink = test_dir.join("round-trip-link");
+        copy_one(&symlink_source, &phone_symlink)
+            .expect("dereference symlink for Android destination");
+        assert!(fs::symlink_metadata(&phone_symlink)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(fs::read(&phone_symlink).unwrap(), contents);
+
+        let local_tree = local.path().join("linked-tree");
+        fs::create_dir(&local_tree).unwrap();
+        fs::write(local_tree.join("nested.bin"), b"nested contents").unwrap();
+        let tree_link = local.path().join("linked-dir");
+        std::os::unix::fs::symlink(&local_tree, &tree_link).unwrap();
+        let phone_tree = test_dir.join("linked-dir");
+        copy_one(&tree_link, &phone_tree).expect("dereference directory symlink for Android");
+        assert!(fs::metadata(&phone_tree).unwrap().is_dir());
+        assert_eq!(
+            fs::read(phone_tree.join("nested.bin")).unwrap(),
+            b"nested contents"
+        );
+
+        let cycle_tree = local.path().join("cycle-tree");
+        fs::create_dir(&cycle_tree).unwrap();
+        std::os::unix::fs::symlink(&cycle_tree, cycle_tree.join("loop")).unwrap();
+        assert!(copy_one(&cycle_tree, &test_dir.join("cycle-tree")).is_err());
+        assert!(!test_dir.join("cycle-tree").exists());
+
+        let existing = artifacts
+            .mount
+            .file_for(&test_dir.join("existing.bin"))
+            .unwrap();
+        let existing_output = existing
+            .create(gio::FileCreateFlags::NONE, gio::Cancellable::NONE)
+            .unwrap();
+        existing_output
+            .write_all(b"preserve", gio::Cancellable::NONE)
+            .unwrap();
+        existing_output.close(gio::Cancellable::NONE).unwrap();
+        assert!(copy_one(&source, &test_dir.join("existing.bin")).is_err());
+        assert_eq!(
+            fs::read(test_dir.join("existing.bin")).unwrap(),
+            b"preserve"
+        );
+
+        let large_source = local.path().join("cancel-source.bin");
+        fs::write(&large_source, vec![9u8; 16 * 1024 * 1024]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let outcome = transfer_with_events(
+            std::slice::from_ref(&large_source),
+            &test_dir,
+            false,
+            ConflictPolicy::Skip,
+            &cancel,
+            &mut |_, _, _| {},
+            &mut |progress| {
+                if progress.bytes_done > 0 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert!(outcome.cancelled);
+        assert!(!test_dir.join("cancel-source.bin").exists());
+
+        artifacts
+            .cleanup()
+            .expect("clean only test-created device files");
+        let test_directory = artifacts.mount.file_for(&test_dir).unwrap();
+        assert!(!test_directory.query_exists(gio::Cancellable::NONE));
+    }
+
+    #[test]
     fn move_never_overwrites_an_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.txt");
@@ -2537,6 +3723,24 @@ mod tests {
     }
 
     #[test]
+    fn cut_to_the_same_folder_is_a_completed_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.txt");
+        write_file(&source, "still here");
+        let outcome = transfer(
+            std::slice::from_ref(&source),
+            dir.path(),
+            true,
+            ConflictPolicy::Skip,
+            &AtomicBool::new(false),
+            &mut |_, _, _, _, _| {},
+        );
+        assert_eq!(outcome.completed_sources, vec![source.clone()]);
+        assert!(outcome.moves.is_empty());
+        assert!(source.exists());
+    }
+
+    #[test]
     fn transfer_keep_both_uses_a_numbered_name() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
@@ -2564,6 +3768,179 @@ mod tests {
     }
 
     #[test]
+    fn detailed_copy_reports_nested_files_and_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tree");
+        let destination = dir.path().join("destination");
+        fs::create_dir_all(source.join("nested/deep")).unwrap();
+        fs::create_dir(&destination).unwrap();
+        write_file(&source.join("nested/deep/one.txt"), "one");
+        write_file(&source.join("nested/two.txt"), "two");
+
+        let mut final_states = std::collections::HashMap::new();
+        let mut byte_paths = std::collections::HashSet::new();
+        let outcome = transfer_with_events(
+            std::slice::from_ref(&source),
+            &destination,
+            false,
+            ConflictPolicy::Skip,
+            &AtomicBool::new(false),
+            &mut |path, _, event| match event {
+                ItemEvent::Completed => {
+                    final_states.insert(path.to_path_buf(), "completed");
+                }
+                ItemEvent::Skipped => {
+                    final_states.insert(path.to_path_buf(), "skipped");
+                }
+                ItemEvent::Failed(_) => {
+                    final_states.insert(path.to_path_buf(), "failed");
+                }
+                ItemEvent::Started | ItemEvent::Cancelled => {}
+            },
+            &mut |progress| {
+                if progress.bytes_done > 0 {
+                    byte_paths.insert(progress.path);
+                }
+            },
+        );
+
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert_eq!(
+            final_states.get(&source.join("nested/deep/one.txt")),
+            Some(&"completed")
+        );
+        assert_eq!(
+            final_states.get(&source.join("nested/two.txt")),
+            Some(&"completed")
+        );
+        assert_eq!(final_states.get(&source.join("nested")), Some(&"completed"));
+        assert_eq!(
+            final_states.get(&source),
+            Some(&"completed"),
+            "folder completion follows all descendants"
+        );
+        assert_eq!(outcome.completed_sources, vec![source.clone()]);
+        assert!(byte_paths.contains(&source.join("nested/deep/one.txt")));
+        assert_eq!(
+            fs::read_to_string(destination.join("tree/nested/deep/one.txt")).unwrap(),
+            "one"
+        );
+    }
+
+    #[test]
+    fn detailed_move_keeps_nested_contents_and_reports_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tree");
+        let destination = dir.path().join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir(&destination).unwrap();
+        write_file(&source.join("nested/file.txt"), "move");
+        let mut final_states = std::collections::HashMap::new();
+        let outcome = transfer_with_events(
+            std::slice::from_ref(&source),
+            &destination,
+            true,
+            ConflictPolicy::Skip,
+            &AtomicBool::new(false),
+            &mut |path, _, event| {
+                if event == ItemEvent::Completed {
+                    final_states.insert(path.to_path_buf(), "completed");
+                }
+            },
+            &mut |_| {},
+        );
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("tree/nested/file.txt")).unwrap(),
+            "move"
+        );
+        assert_eq!(final_states.get(&source), Some(&"completed"));
+        assert_eq!(final_states.get(&source.join("nested")), Some(&"completed"));
+        assert_eq!(
+            final_states.get(&source.join("nested/file.txt")),
+            Some(&"completed")
+        );
+    }
+
+    #[test]
+    fn transfer_inventory_counts_many_small_files_and_large_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("large.bin"), vec![7u8; 2 * 1024 * 1024]).unwrap();
+        for index in 0..256 {
+            write_file(&source.join("nested").join(format!("{index}.txt")), "x");
+        }
+
+        let inventory = transfer_inventory(std::slice::from_ref(&source));
+        assert_eq!(inventory.total_folders, 2);
+        assert_eq!(inventory.total_files, 257);
+        assert_eq!(inventory.total_bytes, 2 * 1024 * 1024 + 256);
+        assert_eq!(inventory.items.len(), 259);
+    }
+
+    #[test]
+    fn transfer_sources_drop_duplicates_and_selected_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tree");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        let nested = source.join("nested/item.txt");
+        write_file(&nested, "item");
+        let other = dir.path().join("other.txt");
+        write_file(&other, "other");
+
+        let normalized =
+            normalize_transfer_sources(&[nested, source.clone(), source.clone(), other.clone()]);
+        assert_eq!(normalized, vec![source, other]);
+        let inventory = transfer_inventory(&normalized);
+        assert_eq!(inventory.total_files, 2);
+        assert_eq!(inventory.total_folders, 2);
+    }
+
+    #[test]
+    fn partial_transfer_keeps_successes_and_reports_failed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("good.txt");
+        let destination = dir.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        write_file(&source, "copied");
+        let outcome = transfer(
+            &[source, PathBuf::from("/dev/null")],
+            &destination,
+            false,
+            ConflictPolicy::Skip,
+            &AtomicBool::new(false),
+            &mut |_, _, _, _, _| {},
+        );
+        assert_eq!(outcome.created, vec![destination.join("good.txt")]);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].0, PathBuf::from("/dev/null"));
+        assert!(destination.join("good.txt").is_file());
+    }
+
+    #[test]
+    fn detailed_permanent_delete_reports_nested_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        write_file(&root.join("nested/file.txt"), "delete");
+        let mut completed = std::collections::HashSet::new();
+        let deleted =
+            remove_tree_detailed(&root, &AtomicBool::new(false), &mut |path, _, event| {
+                if event == ItemEvent::Completed {
+                    completed.insert(path.to_path_buf());
+                }
+            })
+            .unwrap();
+        assert!(deleted);
+        assert!(!root.exists());
+        assert!(completed.contains(&root));
+        assert!(completed.contains(&root.join("nested")));
+        assert!(completed.contains(&root.join("nested/file.txt")));
+    }
+
+    #[test]
     fn cancelled_transfer_reports_cancellation_and_copies_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
@@ -2583,6 +3960,42 @@ mod tests {
         assert!(outcome.cancelled);
         assert!(outcome.created.is_empty());
         assert!(!dst.join("a.txt").exists());
+    }
+
+    #[test]
+    fn cancellation_during_large_file_copy_removes_partial_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("large.bin");
+        let dst = dir.path().join("destination");
+        fs::create_dir(&dst).unwrap();
+        fs::write(&src, vec![3u8; 16 * 1024 * 1024]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut observed_progress = false;
+        let outcome = transfer_with_events(
+            std::slice::from_ref(&src),
+            &dst,
+            false,
+            ConflictPolicy::Skip,
+            &cancel,
+            &mut |_, _, _| {},
+            &mut |progress| {
+                if progress.bytes_done > 0 && !observed_progress {
+                    observed_progress = true;
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert!(
+            observed_progress,
+            "the active copy should report byte progress"
+        );
+        assert!(outcome.cancelled);
+        assert!(!dst.join("large.bin").exists());
+        assert_eq!(
+            fs::read_dir(&dst).unwrap().filter_map(Result::ok).count(),
+            0,
+            "partial temporary files must be cleaned up"
+        );
     }
 
     #[test]
@@ -2685,6 +4098,10 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            trash_original_for(&root, "note.txt").as_deref(),
+            Some(original.as_path())
+        );
         let items = trashed_items_in(&root);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].file, trashed);

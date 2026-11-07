@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::fs_entry::{SortKey, SortSpec};
 use crate::paths::config_file;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
     pub show_hidden: bool,
@@ -68,14 +68,14 @@ impl Default for UiConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub ui: UiConfig,
     pub performance: PerformanceConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PerformanceConfig {
     pub keep_running_background: bool,
@@ -150,6 +150,40 @@ impl Config {
         if matches!(mode, "list" | "grid" | "column") {
             self.ui.view_mode = mode.to_owned();
         }
+    }
+
+    pub fn merge_changes_from(&mut self, original: &Self, edited: &Self) {
+        macro_rules! merge_ui_field {
+            ($field:ident) => {
+                if edited.ui.$field != original.ui.$field {
+                    self.ui.$field = edited.ui.$field.clone();
+                }
+            };
+        }
+
+        merge_ui_field!(show_hidden);
+        merge_ui_field!(sort_key);
+        merge_ui_field!(sort_ascending);
+        merge_ui_field!(directories_first);
+        merge_ui_field!(single_click_open);
+        merge_ui_field!(sidebar_visible);
+        merge_ui_field!(sidebar_width);
+        merge_ui_field!(tab_bar_visible);
+        merge_ui_field!(show_size);
+        merge_ui_field!(show_modified);
+        merge_ui_field!(show_kind);
+        merge_ui_field!(compact);
+        merge_ui_field!(view_mode);
+        merge_ui_field!(restore_session);
+        merge_ui_field!(dual_pane);
+        merge_ui_field!(terminal);
+        merge_ui_field!(grid_icon_size);
+        merge_ui_field!(show_tags);
+        merge_ui_field!(preview_visible);
+        merge_ui_field!(search_recursive);
+        merge_ui_field!(drag_hover_delay_ms);
+        merge_ui_field!(window_width);
+        merge_ui_field!(window_height);
     }
 }
 
@@ -247,5 +281,18 @@ mod tests {
         assert_eq!(restored.performance.startup_behavior, "fast_reopen");
         assert_eq!(restored.performance.thumbnail_cache_limit_mb, 1024);
         assert!(restored.ui.preview_visible);
+    }
+
+    #[test]
+    fn config_merge_keeps_updates_from_other_windows() {
+        let original = Config::default();
+        let mut edited = original.clone();
+        edited.ui.show_hidden = true;
+        let mut latest = original.clone();
+        latest.ui.view_mode = "grid".to_owned();
+
+        latest.merge_changes_from(&original, &edited);
+        assert!(latest.ui.show_hidden);
+        assert_eq!(latest.ui.view_mode, "grid");
     }
 }

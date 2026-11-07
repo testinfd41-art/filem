@@ -123,6 +123,20 @@ Item {
                 event.accepted = true
             }
 
+            Keys.onReturnPressed: function(event) {
+                if (!root.showInput) {
+                    root.confirm()
+                    event.accepted = true
+                }
+            }
+
+            Keys.onEnterPressed: function(event) {
+                if (!root.showInput) {
+                    root.confirm()
+                    event.accepted = true
+                }
+            }
+
             Column {
                 id: body
                 x: 20
@@ -236,7 +250,9 @@ Item {
                                 anchors.centerIn: parent
                                 text: modelData.label
                                 color: modelData.danger
-                                       ? (theme ? theme.danger : "#e06c75")
+                                       ? (buttonMouse.containsMouse
+                                          ? (theme ? theme.surface : "#151820")
+                                          : (theme ? theme.danger : "#e06c75"))
                                        : (theme ? theme.foreground : "#e7e9ee")
                                 font.family: theme ? theme.font_family : "sans-serif"
                                 font.pixelSize: 12 * (theme ? theme.font_scale : 1)

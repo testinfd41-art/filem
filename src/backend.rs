@@ -36,6 +36,7 @@ use crate::search;
 use crate::store::{BookmarkStore, RecentItem, RecentStore, Session, SessionTab};
 use crate::sysclip;
 use crate::tags::TagStore;
+use crate::transfer::{self, ItemInfo, ItemResult, JobContext, JobResult, Operation};
 use crate::volumes;
 
 const ROLE_NAME: i32 = USER_ROLE;
@@ -81,36 +82,6 @@ struct ThumbnailJob {
     key: String,
     priority: u8,
     sequence: u64,
-}
-
-fn pause_for_background(&mut self, preserve_directory_state: bool) {
-    self.stop_watch();
-    if preserve_directory_state {
-        return;
-    }
-    for tab in &mut self.tabs_data {
-        tab.generation = tab.generation.wrapping_add(1);
-        tab.tree_generation = tab.tree_generation.wrapping_add(1);
-        tab.search_generation = tab.search_generation.wrapping_add(1);
-        tab.cancel_search();
-        tab.loading = false;
-        tab.search_running = false;
-        tab.entries.clear();
-        tab.tree_rows.clear();
-        tab.tree_children.clear();
-        tab.tree_loading.clear();
-        tab.folder_entries.clear();
-    }
-    self.sync_active(true);
-}
-
-fn resume_from_background(&mut self) {
-    if self.tabs_data.is_empty() {
-        self.start(QString::default());
-        return;
-    }
-    let path = self.tabs_data[self.active].path.clone();
-    self.load_tab(self.active, path, HistoryIntent::Current);
 }
 
 type ThumbnailCallback = Box<dyn FnOnce(ThumbnailResult) + Send + 'static>;
@@ -307,6 +278,7 @@ fn find_desktop_file(app_id: &str) -> Result<PathBuf, String> {
 
 struct SearchState {
     query: String,
+    filters: String,
     recursive: bool,
     truncated: bool,
     visited: usize,
@@ -338,6 +310,7 @@ struct Tab {
     /// Folder contents kept aside while search results are displayed.
     folder_entries: Vec<Entry>,
     loading: bool,
+    loaded_path: Option<PathBuf>,
     error: String,
     generation: u64,
     tree_generation: u64,
@@ -362,6 +335,7 @@ impl Tab {
             tree_loading: HashSet::new(),
             folder_entries: Vec::new(),
             loading: false,
+            loaded_path: None,
             error: String::new(),
             generation: 0,
             tree_generation: 0,
@@ -397,6 +371,10 @@ impl Tab {
         } else {
             self.folder_entries.clear();
         }
+    }
+
+    fn shows_loading_indicator(&self) -> bool {
+        self.loading && self.loaded_path.as_ref() != Some(&self.path)
     }
 
     fn title(&self) -> String {
@@ -483,16 +461,39 @@ fn parse_tag_collection_path(path: &Path) -> Option<(Vec<usize>, bool)> {
     (!selected.is_empty()).then_some((selected, false))
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Clipboard {
     paths: Vec<PathBuf>,
     cut: bool,
+}
+
+#[derive(Default)]
+struct SharedClipboard {
+    revision: u64,
+    clipboard: Option<Clipboard>,
+    last_external_clipboard: Option<sysclip::ClipboardSnapshot>,
+}
+
+static SHARED_CLIPBOARD: OnceLock<Mutex<SharedClipboard>> = OnceLock::new();
+
+fn shared_clipboard() -> &'static Mutex<SharedClipboard> {
+    SHARED_CLIPBOARD.get_or_init(|| Mutex::new(SharedClipboard::default()))
+}
+
+fn publish_shared_clipboard(clipboard: Option<Clipboard>) -> (Option<Clipboard>, u64) {
+    let mut shared = shared_clipboard()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    shared.revision = shared.revision.wrapping_add(1);
+    shared.clipboard = clipboard;
+    (shared.clipboard.clone(), shared.revision)
 }
 
 struct PendingConflict {
     sources: Vec<PathBuf>,
     dest: PathBuf,
     cut: bool,
+    from_clipboard: bool,
 }
 
 struct LoadResult {
@@ -520,12 +521,13 @@ struct PropertySnapshot {
     properties: ops::Properties,
     report: MetadataReport,
     tags: Vec<String>,
+    icon_url: String,
 }
 
 struct SearchResult {
     tab_id: u64,
     generation: u64,
-    outcome: search::SearchOutcome,
+    update: search::SearchUpdate,
 }
 
 struct PreviewResult {
@@ -550,11 +552,115 @@ struct OpTick {
     progress: f64,
 }
 
-struct OpFinished {
-    generation: u64,
+struct TransferFinished {
     undo: Option<UndoOp>,
+    completed_sources: Vec<PathBuf>,
+    from_clipboard: bool,
     message: String,
     error: Option<String>,
+}
+
+fn transfer_job_variant(job: &transfer::JobSnapshot) -> QVariantMap {
+    let mut map = QVariantMap::default();
+    map.insert(
+        QString::from("id"),
+        QVariant::from(QString::from(job.id.to_string())),
+    );
+    map.insert(
+        QString::from("operation"),
+        QVariant::from(QString::from(job.operation.label())),
+    );
+    map.insert(
+        QString::from("status"),
+        QVariant::from(QString::from(job.status.as_str())),
+    );
+    map.insert(
+        QString::from("sources"),
+        QVariant::from(QString::from(job.source_summary())),
+    );
+    map.insert(
+        QString::from("destination"),
+        QVariant::from(QString::from(
+            job.destination
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        )),
+    );
+    map.insert(
+        QString::from("totalFiles"),
+        QVariant::from(job.total_files as i32),
+    );
+    map.insert(
+        QString::from("totalFolders"),
+        QVariant::from(job.total_folders as i32),
+    );
+    map.insert(
+        QString::from("completedFiles"),
+        QVariant::from(job.completed_files as i32),
+    );
+    map.insert(
+        QString::from("completedFolders"),
+        QVariant::from(job.completed_folders as i32),
+    );
+    map.insert(
+        QString::from("pendingItems"),
+        QVariant::from(job.pending_items as i32),
+    );
+    map.insert(
+        QString::from("skippedItems"),
+        QVariant::from(job.skipped_items as i32),
+    );
+    map.insert(
+        QString::from("failedItems"),
+        QVariant::from(job.failed_items as i32),
+    );
+    map.insert(
+        QString::from("currentItem"),
+        QVariant::from(QString::from(
+            job.current_item.to_string_lossy().into_owned(),
+        )),
+    );
+    map.insert(QString::from("progress"), QVariant::from(job.progress));
+    map.insert(
+        QString::from("bytesPerSecond"),
+        QVariant::from(job.bytes_per_second as f64),
+    );
+    map.insert(
+        QString::from("etaSeconds"),
+        QVariant::from(job.eta_seconds.map_or(-1, |value| value as i32)),
+    );
+    map.insert(
+        QString::from("summary"),
+        QVariant::from(QString::from(job.summary.clone())),
+    );
+    map.insert(
+        QString::from("error"),
+        QVariant::from(QString::from(job.error.clone())),
+    );
+    map.insert(
+        QString::from("omittedItemDetails"),
+        QVariant::from(job.omitted_item_details as i32),
+    );
+    map
+}
+
+fn set_transfer_inventory(context: &JobContext, inventory: ops::TransferInventory) {
+    let items = inventory
+        .items
+        .iter()
+        .map(|item| ItemInfo {
+            path: item.path.clone(),
+            is_directory: item.is_directory,
+            size_bytes: item.size_bytes,
+        })
+        .collect::<Vec<_>>();
+    context.set_inventory_counted(
+        &items,
+        inventory.total_files,
+        inventory.total_folders,
+        inventory.total_bytes,
+    );
 }
 
 struct BatchPreviewResult {
@@ -947,6 +1053,9 @@ pub struct Backend {
     op_cancelable: qt_property!(bool; NOTIFY op_changed),
     op_changed: qt_signal!(),
 
+    transfer_jobs: qt_property!(QVariantList; NOTIFY transfer_jobs_changed),
+    transfer_jobs_changed: qt_signal!(),
+
     search_mode: qt_property!(bool; NOTIFY search_changed),
     searching: qt_property!(bool; NOTIFY search_changed),
     search_query: qt_property!(QString; NOTIFY search_changed),
@@ -1061,6 +1170,7 @@ pub struct Backend {
     drop_external_paths:
         qt_method!(fn(&mut self, dest: QString, urls: QVariantList, move_items: bool)),
     paste: qt_method!(fn(&mut self, dest: QString, policy: QString)),
+    refresh_clipboard_state: qt_method!(fn(&mut self)),
     confirm_conflicts: qt_method!(fn(&mut self, policy: QString)),
     cancel_conflicts: qt_method!(fn(&mut self)),
     rename: qt_method!(fn(&mut self, path: QString, name: QString) -> bool),
@@ -1081,6 +1191,12 @@ pub struct Backend {
     undo: qt_method!(fn(&mut self)),
     redo: qt_method!(fn(&mut self)),
     cancel_operation: qt_method!(fn(&mut self)),
+    refresh_transfer_jobs: qt_method!(fn(&mut self)),
+    transfer_job_items: qt_method!(fn(&self, id: QString) -> QVariantList),
+    cancel_transfer_job: qt_method!(fn(&mut self, id: QString)),
+    cancel_pending_transfers: qt_method!(fn(&mut self)),
+    clear_completed_transfers: qt_method!(fn(&mut self)),
+    retry_transfer_job: qt_method!(fn(&mut self, id: QString)),
 
     add_bookmark: qt_method!(fn(&mut self, path: QString, label: QString) -> bool),
     toggle_bookmark: qt_method!(fn(&mut self, path: QString) -> bool),
@@ -1091,8 +1207,11 @@ pub struct Backend {
     flush_recent_history: qt_method!(fn(&mut self)),
 
     search: qt_method!(fn(&mut self, query: QString, recursive: bool)),
+    search_advanced: qt_method!(fn(&mut self, query: QString, filters: QString, recursive: bool)),
     clear_search: qt_method!(fn(&mut self)),
     set_search_recursive: qt_method!(fn(&mut self, recursive: bool)),
+    set_search_recursive_advanced:
+        qt_method!(fn(&mut self, query: QString, filters: QString, recursive: bool)),
     copy_paths_text: qt_method!(fn(&mut self, paths: QVariantList) -> bool),
     paths_uri_list: qt_method!(fn(&self, paths: QVariantList) -> QString),
     open_terminal: qt_method!(fn(&mut self, path: QString)),
@@ -1101,7 +1220,7 @@ pub struct Backend {
     file_url: qt_method!(fn(&self, path: QString) -> QString),
     thumbnail_url: qt_method!(fn(&self, path: QString) -> QString),
     request_thumbnail: qt_method!(fn(&mut self, path: QString, visible: bool)),
-    pause_for_background: qt_method!(fn(&mut self, preserve_directory_state: bool)),
+    pause_for_background: qt_method!(fn(&mut self)),
     resume_from_background: qt_method!(fn(&mut self)),
 
     tabs_data: Vec<Tab>,
@@ -1109,6 +1228,7 @@ pub struct Backend {
     next_tab_id: u64,
     closed_tabs: Vec<PathBuf>,
     config: Config,
+    persisted_config: Config,
     icons: Arc<IconResolver>,
     tag_store: TagStore,
     bookmark_store: BookmarkStore,
@@ -1117,6 +1237,7 @@ pub struct Backend {
     pending_recent: HashMap<u64, PendingRecentFile>,
     next_recent_id: u64,
     clipboard: Option<Clipboard>,
+    clipboard_revision: u64,
     undo_stack: Vec<UndoOp>,
     redo_stack: Vec<RedoOp>,
     op_generation: u64,
@@ -1218,6 +1339,8 @@ impl Default for Backend {
             op_progress: 0.0,
             op_cancelable: false,
             op_changed: Default::default(),
+            transfer_jobs: QVariantList::default(),
+            transfer_jobs_changed: Default::default(),
             search_mode: false,
             searching: false,
             search_query: Default::default(),
@@ -1312,6 +1435,7 @@ impl Default for Backend {
             drop_paths: Default::default(),
             drop_external_paths: Default::default(),
             paste: Default::default(),
+            refresh_clipboard_state: Default::default(),
             confirm_conflicts: Default::default(),
             cancel_conflicts: Default::default(),
             rename: Default::default(),
@@ -1330,6 +1454,12 @@ impl Default for Backend {
             undo: Default::default(),
             redo: Default::default(),
             cancel_operation: Default::default(),
+            refresh_transfer_jobs: Default::default(),
+            transfer_job_items: Default::default(),
+            cancel_transfer_job: Default::default(),
+            cancel_pending_transfers: Default::default(),
+            clear_completed_transfers: Default::default(),
+            retry_transfer_job: Default::default(),
             add_bookmark: Default::default(),
             toggle_bookmark: Default::default(),
             remove_bookmark: Default::default(),
@@ -1338,8 +1468,10 @@ impl Default for Backend {
             clear_recent_history: Default::default(),
             flush_recent_history: Default::default(),
             search: Default::default(),
+            search_advanced: Default::default(),
             clear_search: Default::default(),
             set_search_recursive: Default::default(),
+            set_search_recursive_advanced: Default::default(),
             copy_paths_text: Default::default(),
             paths_uri_list: Default::default(),
             open_terminal: Default::default(),
@@ -1355,6 +1487,7 @@ impl Default for Backend {
             next_tab_id: 1,
             closed_tabs: Vec::new(),
             config: config.clone(),
+            persisted_config: config.clone(),
             icons: IconResolver::shared(),
             tag_store: TagStore::default(),
             bookmark_store: BookmarkStore::default(),
@@ -1363,6 +1496,7 @@ impl Default for Backend {
             pending_recent: HashMap::new(),
             next_recent_id: 1,
             clipboard: None,
+            clipboard_revision: 0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             op_generation: 0,
@@ -1727,7 +1861,12 @@ fn property_map_many(snapshots: Vec<PropertySnapshot>) -> QVariantMap {
     if snapshots.len() == 1 {
         let snapshot = snapshots.into_iter().next().expect("single snapshot");
         let tag_name = snapshot.tags.join(", ");
+        let icon_url = snapshot.icon_url.clone();
         let mut map = property_map(snapshot.properties, snapshot.report);
+        map.insert(
+            QString::from("iconUrl"),
+            QVariant::from(QString::from(icon_url)),
+        );
         map.insert(
             QString::from("tagName"),
             QVariant::from(QString::from(if tag_name.is_empty() {
@@ -1741,6 +1880,12 @@ fn property_map_many(snapshots: Vec<PropertySnapshot>) -> QVariantMap {
     }
 
     let count = snapshots.len();
+    let icon_url = snapshots
+        .iter()
+        .map(|snapshot| snapshot.icon_url.as_str())
+        .find(|url| !url.is_empty())
+        .unwrap_or("")
+        .to_owned();
     let mut values: BTreeMap<(String, String), Vec<Option<String>>> = BTreeMap::new();
     let mut warnings = HashSet::new();
     let mut kinds = HashSet::new();
@@ -1797,6 +1942,10 @@ fn property_map_many(snapshots: Vec<PropertySnapshot>) -> QVariantMap {
         } else {
             "Multiple locations".to_owned()
         })),
+    );
+    map.insert(
+        QString::from("iconUrl"),
+        QVariant::from(QString::from(icon_url)),
     );
     map.insert(QString::from("selectedCount"), QVariant::from(count as i32));
     map.insert(QString::from("details"), QVariant::from(fields));
@@ -2072,10 +2221,19 @@ impl Backend {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let icons = IconResolver::shared();
+                    let icon_url = icons
+                        .resolve_first(&icon_names_for(
+                            &properties.name,
+                            properties.is_directory,
+                            &properties.extension,
+                        ))
+                        .unwrap_or_default();
                     Ok(PropertySnapshot {
                         properties,
                         report,
                         tags: tags_for_path,
+                        icon_url,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>();
@@ -2277,7 +2435,7 @@ impl Backend {
         title: String,
         action: impl FnOnce(Arc<AtomicBool>) -> Result<String, String> + Send + 'static,
     ) {
-        if self.op_active {
+        if self.non_transfer_operation_busy() {
             self.set_error("Wait for the current file operation to finish first.");
             return;
         }
@@ -2891,6 +3049,36 @@ impl Backend {
         self.schedule_startup_state_load();
     }
 
+    fn pause_for_background(&mut self) {
+        self.stop_watch();
+        if crate::lifecycle::performance_config().startup_behavior == "fast_reopen" {
+            return;
+        }
+        for tab in &mut self.tabs_data {
+            tab.generation = tab.generation.wrapping_add(1);
+            tab.tree_generation = tab.tree_generation.wrapping_add(1);
+            tab.search_generation = tab.search_generation.wrapping_add(1);
+            tab.cancel_search();
+            tab.loading = false;
+            tab.search_running = false;
+            tab.entries.clear();
+            tab.tree_rows.clear();
+            tab.tree_children.clear();
+            tab.tree_loading.clear();
+            tab.folder_entries.clear();
+        }
+        self.sync_active(true);
+    }
+
+    fn resume_from_background(&mut self) {
+        if self.tabs_data.is_empty() {
+            self.start(QString::default());
+            return;
+        }
+        let path = self.tabs_data[self.active].path.clone();
+        self.load_tab(self.active, path, HistoryIntent::Current);
+    }
+
     fn restore_session(&mut self) -> Option<PathBuf> {
         let session = Session::load();
         if session.is_empty() {
@@ -3085,7 +3273,7 @@ impl Backend {
         });
 
         std::thread::spawn(move || {
-            let (entries, stale_tag_paths) = if recent_view {
+            let (mut entries, stale_tag_paths) = if recent_view {
                 (
                     Ok(read_recent_files(&recent_items, spec, &icons, &tags)),
                     Vec::new(),
@@ -3106,6 +3294,16 @@ impl Backend {
                     Vec::new(),
                 )
             };
+            if target == trash_dir() {
+                if let Ok(entries) = &mut entries {
+                    let trash_root = ops::home_trash();
+                    for entry in entries {
+                        entry.display_path = ops::trash_original_for(&trash_root, &entry.name)
+                            .map(|original| ops::display_path(&original))
+                            .unwrap_or_else(|| "/unknown".to_owned());
+                    }
+                }
+            }
             callback(LoadResult {
                 tab_id,
                 generation,
@@ -3349,22 +3547,6 @@ impl Backend {
         match result.entries {
             Ok(mut entries) => {
                 let in_trash = result.path == trash_dir();
-                let trash_map: HashMap<String, PathBuf> = if in_trash {
-                    ops::trashed_items_in(&ops::home_trash())
-                        .into_iter()
-                        .map(|item| {
-                            (
-                                item.file
-                                    .file_name()
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_default(),
-                                item.original,
-                            )
-                        })
-                        .collect()
-                } else {
-                    HashMap::new()
-                };
                 if !is_virtual_collection(&result.path) && !in_trash {
                     let listed = entries
                         .iter()
@@ -3403,15 +3585,6 @@ impl Backend {
                         self.tag_store
                             .record_seen(&entry.path, entry.dev, entry.ino);
                     }
-                    if in_trash {
-                        if let Some(original) = trash_map.get(&entry.name) {
-                            entry.display_path = ops::display_path(original);
-                        }
-                        if !is_virtual_collection(&result.path) {
-                            self.tag_store.record_directory(&result.path);
-                        }
-                        self.push_tags_property();
-                    }
                 }
                 let mut recent_store_changed = false;
                 if is_recent_path(&result.path) {
@@ -3441,6 +3614,7 @@ impl Backend {
                 {
                     let tab = &mut self.tabs_data[index];
                     tab.path = result.path.clone();
+                    tab.loaded_path = Some(result.path.clone());
                     tab.install_folder_entries(entries);
                     tab.error.clear();
                     if !tree_model_active {
@@ -4745,7 +4919,10 @@ impl Backend {
                 QString::from("active"),
                 QVariant::from(index == self.active),
             );
-            map.insert(QString::from("loading"), QVariant::from(tab.loading));
+            map.insert(
+                QString::from("loading"),
+                QVariant::from(tab.shows_loading_indicator()),
+            );
             map.insert(
                 QString::from("searching"),
                 QVariant::from(tab.search.is_some()),
@@ -4805,14 +4982,141 @@ impl Backend {
         self.set_clipboard(list_paths(&paths), true);
     }
 
+    fn apply_clipboard_snapshot(&mut self, clipboard: Option<Clipboard>, revision: u64) {
+        let mut paths = QVariantList::default();
+        if let Some(clipboard) = &clipboard {
+            for path in &clipboard.paths {
+                paths.push(QVariant::from(QString::from(
+                    path.to_string_lossy().into_owned(),
+                )));
+            }
+        }
+        self.clipboard_count = paths.len().min(i32::MAX as usize) as i32;
+        self.clipboard_cut = clipboard.as_ref().is_some_and(|clipboard| clipboard.cut);
+        self.clipboard_paths = paths;
+        self.clipboard = clipboard;
+        self.clipboard_revision = revision;
+        self.clipboard_changed();
+    }
+
+    fn refresh_clipboard_state(&mut self) {
+        if let Some(mut external) = sysclip::read_clipboard() {
+            external.paths.retain(|path| path.exists());
+            external.paths.sort();
+            external.paths = ops::normalize_transfer_sources(&external.paths);
+            let current = {
+                let mut shared = shared_clipboard()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if shared.last_external_clipboard.as_ref() == Some(&external) {
+                    None
+                } else {
+                    shared.last_external_clipboard = Some(external.clone());
+                    Some(shared.clipboard.clone())
+                }
+            };
+            if let Some(current) = current {
+                let matches = current.as_ref().is_some_and(|clipboard| {
+                    clipboard.paths == external.paths
+                        && external.cut.map_or(true, |cut| clipboard.cut == cut)
+                }) || (current.is_none() && external.paths.is_empty());
+                if !matches {
+                    let clipboard = (!external.paths.is_empty()).then_some(Clipboard {
+                        paths: external.paths,
+                        cut: external.cut.unwrap_or(false),
+                    });
+                    publish_shared_clipboard(clipboard);
+                }
+            }
+        }
+
+        self.refresh_shared_clipboard_state();
+    }
+
+    fn refresh_shared_clipboard_state(&mut self) {
+        let (revision, clipboard) = {
+            let shared = shared_clipboard()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (shared.revision, shared.clipboard.clone())
+        };
+        if revision != self.clipboard_revision {
+            self.apply_clipboard_snapshot(clipboard, revision);
+        }
+    }
+
+    fn update_clipboard_path(&mut self, from: &Path, to: &Path) {
+        let snapshot = {
+            let mut shared = shared_clipboard()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(clipboard) = &mut shared.clipboard else {
+                return;
+            };
+            let mut changed = false;
+            for path in &mut clipboard.paths {
+                if path == from {
+                    *path = to.to_path_buf();
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+            shared.revision = shared.revision.wrapping_add(1);
+            (shared.clipboard.clone(), shared.revision)
+        };
+        self.apply_clipboard_snapshot(snapshot.0.clone(), snapshot.1);
+        if let Some(clipboard) = &snapshot.0 {
+            self.remember_system_clipboard();
+            let _ = sysclip::write_paths(&clipboard.paths);
+        }
+    }
+
+    fn remember_system_clipboard(&self) {
+        let Some(mut external) = sysclip::read_clipboard() else {
+            return;
+        };
+        external.paths.retain(|path| path.exists());
+        external.paths.sort();
+        external.paths.dedup();
+        let mut shared = shared_clipboard()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        shared.last_external_clipboard = Some(external);
+    }
+
+    fn complete_clipboard_paths(&mut self, completed_paths: &[PathBuf]) {
+        let Some(mut clipboard) = self.clipboard.clone() else {
+            return;
+        };
+        let original_count = clipboard.paths.len();
+        clipboard
+            .paths
+            .retain(|path| !completed_paths.iter().any(|completed| completed == path));
+        if clipboard.paths.len() == original_count {
+            return;
+        }
+        let next = (!clipboard.paths.is_empty()).then_some(clipboard);
+        let (next, revision) = publish_shared_clipboard(next);
+        self.apply_clipboard_snapshot(next.clone(), revision);
+        self.remember_system_clipboard();
+        if let Some(clipboard) = next {
+            let _ = sysclip::write_paths(&clipboard.paths);
+        } else {
+            let _ = sysclip::clear();
+        }
+    }
+
     fn set_clipboard(&mut self, mut paths: Vec<PathBuf>, cut: bool) {
         paths.retain(|path| path.exists());
         paths.sort();
-        paths.dedup();
+        paths = ops::normalize_transfer_sources(&paths);
         if paths.is_empty() {
             self.set_error("Nothing to put on the clipboard.");
             return;
         }
+        self.remember_system_clipboard();
         match sysclip::write_paths(&paths) {
             Ok(()) => {}
             Err(note) => {
@@ -4821,17 +5125,9 @@ impl Backend {
             }
         }
         let count = paths.len();
-        let mut list = QVariantList::default();
-        for path in &paths {
-            list.push(QVariant::from(QString::from(
-                path.to_string_lossy().into_owned(),
-            )));
-        }
-        self.clipboard_paths = list;
-        self.clipboard = Some(Clipboard { paths, cut });
-        self.clipboard_count = count.min(i32::MAX as usize) as i32;
-        self.clipboard_cut = cut;
-        self.clipboard_changed();
+        let clipboard = Clipboard { paths, cut };
+        let (clipboard, revision) = publish_shared_clipboard(Some(clipboard));
+        self.apply_clipboard_snapshot(clipboard, revision);
         self.status = QString::from(format!(
             "{} {count} {}",
             if cut { "Cut" } else { "Copied" },
@@ -4909,7 +5205,7 @@ impl Backend {
         } else {
             move_items
         };
-        self.execute_transfer_paths(dest, sources, move_items, policy);
+        self.execute_transfer_paths(dest, sources, move_items, policy, false);
     }
 
     fn paste(&mut self, dest: QString, policy: QString) {
@@ -4917,6 +5213,7 @@ impl Backend {
             self.set_error("Another operation is still running.");
             return;
         }
+        self.refresh_clipboard_state();
         let dest = PathBuf::from(dest.to_string());
         if is_virtual_collection(&dest) {
             self.set_error("Choose a real folder as the transfer destination.");
@@ -4941,7 +5238,7 @@ impl Backend {
             self.set_error("There are no files on the clipboard.");
             return;
         }
-        self.execute_transfer_paths(dest, sources, cut, policy);
+        self.execute_transfer_paths(dest, sources, cut, policy, true);
     }
 
     fn execute_transfer_paths(
@@ -4950,7 +5247,13 @@ impl Backend {
         sources: Vec<PathBuf>,
         cut: bool,
         policy: QString,
+        from_clipboard: bool,
     ) {
+        let sources = ops::normalize_transfer_sources(&sources);
+        if sources.is_empty() {
+            self.set_error("There are no files to transfer.");
+            return;
+        }
         let policy_value = ConflictPolicy::parse(&policy.to_string());
         if policy_value == Some(ConflictPolicy::Ask) || policy_value.is_none() {
             let mut names = Vec::new();
@@ -4978,13 +5281,18 @@ impl Backend {
                 ));
                 self.conflict_pending = true;
                 self.conflict_changed();
-                self.pending_conflict = Some(PendingConflict { sources, dest, cut });
+                self.pending_conflict = Some(PendingConflict {
+                    sources,
+                    dest,
+                    cut,
+                    from_clipboard,
+                });
                 return;
             }
-            self.start_transfer(dest, sources, cut, ConflictPolicy::Skip);
+            self.start_transfer(dest, sources, cut, ConflictPolicy::Skip, from_clipboard);
             return;
         }
-        self.start_transfer(dest, sources, cut, policy_value.unwrap());
+        self.start_transfer(dest, sources, cut, policy_value.unwrap(), from_clipboard);
     }
 
     fn cancel_conflicts(&mut self) {
@@ -5000,7 +5308,13 @@ impl Backend {
         };
         self.clear_conflict_property();
         let policy = ConflictPolicy::parse(&policy.to_string()).unwrap_or(ConflictPolicy::Skip);
-        self.start_transfer(pending.dest, pending.sources, pending.cut, policy);
+        self.start_transfer(
+            pending.dest,
+            pending.sources,
+            pending.cut,
+            policy,
+            pending.from_clipboard,
+        );
     }
 
     fn clear_conflict_property(&mut self) {
@@ -5033,135 +5347,308 @@ impl Backend {
         self.cancel_flag = None;
     }
 
+    fn non_transfer_operation_busy(&self) -> bool {
+        self.op_active || transfer::is_busy()
+    }
+
     fn start_transfer(
         &mut self,
         dest: PathBuf,
         sources: Vec<PathBuf>,
         cut: bool,
         policy: ConflictPolicy,
+        from_clipboard: bool,
     ) {
+        if self.op_active {
+            self.set_error("Another operation is still running.");
+            return;
+        }
         let total = sources.len();
-        let title = format!(
-            "{} {total} {}",
-            if cut { "Moving" } else { "Copying" },
-            item_word(total)
+        let operation = if cut {
+            Operation::Move
+        } else {
+            Operation::Copy
+        };
+        let qptr = QPointer::from(&*self);
+        let done_cb = qmetaobject::queued_callback(move |done: TransferFinished| {
+            if let Some(backend) = qptr.as_pinned() {
+                backend.borrow_mut().apply_transfer_finished(done);
+            }
+        });
+
+        let enqueue_result = transfer::enqueue(
+            operation,
+            sources.clone(),
+            Some(dest.clone()),
+            move |context| {
+                set_transfer_inventory(&context, ops::transfer_inventory(&sources));
+
+                let cancel = context.cancellation_token();
+                let mut events =
+                    |path: &Path, is_directory: bool, event: ops::ItemEvent| match event {
+                        ops::ItemEvent::Started => context.start_item(path),
+                        ops::ItemEvent::Completed if is_directory => {
+                            context.finish_item(path, true, ItemResult::Completed, "");
+                            context.finish_subtree(path, ItemResult::Completed, "");
+                        }
+                        ops::ItemEvent::Completed => {
+                            context.finish_item(path, is_directory, ItemResult::Completed, "")
+                        }
+                        ops::ItemEvent::Skipped => {
+                            context.finish_item(path, is_directory, ItemResult::Skipped, "");
+                            context.finish_subtree(path, ItemResult::Skipped, "");
+                        }
+                        ops::ItemEvent::Cancelled => {
+                            context.finish_item(path, is_directory, ItemResult::Cancelled, "");
+                            context.finish_subtree(path, ItemResult::Cancelled, "");
+                        }
+                        ops::ItemEvent::Failed(error) => {
+                            context.finish_item(
+                                path,
+                                is_directory,
+                                ItemResult::Failed,
+                                error.clone(),
+                            );
+                            context.finish_subtree(path, ItemResult::Failed, error);
+                        }
+                    };
+                let outcome = ops::transfer_with_events(
+                    &sources,
+                    &dest,
+                    cut,
+                    policy,
+                    &cancel,
+                    &mut events,
+                    &mut |progress| {
+                        if !progress.path.as_os_str().is_empty() {
+                            context.report_file_progress(
+                                &progress.path,
+                                progress.bytes_done,
+                                progress.file_bytes,
+                            );
+                        }
+                    },
+                );
+
+                let mut message = if outcome.cancelled {
+                    format!(
+                        "Cancelled: {} of {total} {} processed.",
+                        outcome.created.len() + outcome.moves.len(),
+                        item_word(total)
+                    )
+                } else if cut {
+                    format!(
+                        "Moved {} {}",
+                        outcome.moves.len(),
+                        item_word(outcome.moves.len())
+                    )
+                } else {
+                    format!(
+                        "Copied {} {}",
+                        outcome.created.len(),
+                        item_word(outcome.created.len())
+                    )
+                };
+                if !outcome.skipped.is_empty() {
+                    message.push_str(&format!(" · {} skipped", outcome.skipped.len()));
+                }
+                if !outcome.failed.is_empty() {
+                    message.push_str(&format!(" · {} failed", outcome.failed.len()));
+                }
+                let undo = if cut {
+                    (!outcome.moves.is_empty()).then(|| UndoOp::Move {
+                        pairs: outcome.moves.clone(),
+                    })
+                } else {
+                    (!outcome.created.is_empty()).then(|| UndoOp::Copy {
+                        created: outcome.created.clone(),
+                    })
+                };
+                let error = if outcome.failed.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} {} failed: {}",
+                        outcome.failed.len(),
+                        item_word(outcome.failed.len()),
+                        summarize_failures(&outcome.failed)
+                    ))
+                };
+                done_cb(TransferFinished {
+                    undo,
+                    completed_sources: outcome.completed_sources.clone(),
+                    from_clipboard,
+                    message: message.clone(),
+                    error: error.clone(),
+                });
+                if outcome.cancelled {
+                    JobResult::cancelled(message)
+                } else if let Some(error) = error {
+                    JobResult::failed(message, error)
+                } else {
+                    JobResult::completed(message)
+                }
+            },
         );
-        let generation = self.begin_operation(title, true);
-        let cancel = self
-            .cancel_flag
-            .clone()
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        if let Err(error) = enqueue_result {
+            self.set_error(error);
+            return;
+        }
+        self.refresh_transfer_jobs();
+    }
 
-        let qptr = QPointer::from(&*self);
-        let tick_cb = qmetaobject::queued_callback(move |tick: OpTick| {
-            if let Some(backend) = qptr.as_pinned() {
-                backend.borrow_mut().apply_op_tick(tick);
+    fn apply_transfer_finished(&mut self, done: TransferFinished) {
+        if done.from_clipboard && !done.completed_sources.is_empty() {
+            self.complete_clipboard_paths(&done.completed_sources);
+        }
+        if let Some(undo) = done.undo {
+            self.push_undo(undo);
+        }
+        if let Some(error) = done.error {
+            self.set_transfer_error(error);
+        } else {
+            self.error = QString::from("");
+            self.error_changed();
+            if let Some(tab) = self.tabs_data.get_mut(self.active) {
+                tab.error.clear();
             }
-        });
-        let qptr = QPointer::from(&*self);
-        let done_cb = qmetaobject::queued_callback(move |done: OpFinished| {
-            if let Some(backend) = qptr.as_pinned() {
-                backend.borrow_mut().apply_op_finished(done);
-            }
-        });
+        }
+        self.status = QString::from(done.message);
+        self.status_changed();
+        self.refresh_transfer_jobs();
+        self.refresh();
+    }
 
-        std::thread::spawn(move || {
-            let mut last = Instant::now();
-            let outcome = ops::transfer(
-                &sources,
-                &dest,
-                cut,
-                policy,
-                &cancel,
-                &mut |index, count, name, done_bytes, file_bytes| {
-                    let now = Instant::now();
-                    let finished_file = file_bytes > 0 && done_bytes >= file_bytes;
-                    if now.duration_since(last) < Duration::from_millis(90) && !finished_file {
-                        return;
-                    }
-                    last = now;
-                    let item_fraction = if file_bytes > 0 {
-                        (done_bytes as f64 / file_bytes as f64).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let progress = if count > 0 {
-                        ((index as f64) + item_fraction) / count as f64
-                    } else {
-                        0.0
-                    };
-                    let detail = if file_bytes > 0 {
-                        format!(
-                            "{name} · {} of {}",
-                            format_size(done_bytes),
-                            format_size(file_bytes)
-                        )
-                    } else {
-                        name.to_owned()
-                    };
-                    tick_cb(OpTick {
-                        generation,
-                        detail,
-                        progress,
-                    });
-                },
+    fn refresh_transfer_jobs(&mut self) {
+        let jobs = transfer::snapshots();
+        let mut list = QVariantList::default();
+        for job in &jobs {
+            list.push(QVariant::from(transfer_job_variant(job)));
+        }
+        self.transfer_jobs = list;
+        self.transfer_jobs_changed();
+    }
+
+    fn transfer_job_items(&self, id: QString) -> QVariantList {
+        let Ok(id) = id.to_string().parse::<u64>() else {
+            return QVariantList::default();
+        };
+        let Some(job) = transfer::job(id) else {
+            return QVariantList::default();
+        };
+        let mut list = QVariantList::default();
+        for item in job.items {
+            let mut map = QVariantMap::default();
+            map.insert(
+                QString::from("path"),
+                QVariant::from(QString::from(item.path.to_string_lossy().into_owned())),
             );
-            let mut message = if outcome.cancelled {
-                format!(
-                    "Cancelled: {} of {total} {} processed.",
-                    outcome.created.len() + outcome.moves.len(),
-                    item_word(total)
-                )
-            } else if cut {
-                format!(
-                    "Moved {} {}",
-                    outcome.moves.len(),
-                    item_word(outcome.moves.len())
-                )
-            } else {
-                format!(
-                    "Copied {} {}",
-                    outcome.created.len(),
-                    item_word(outcome.created.len())
-                )
-            };
-            if !outcome.skipped.is_empty() {
-                message.push_str(&format!(" · {} skipped", outcome.skipped.len()));
+            map.insert(
+                QString::from("name"),
+                QVariant::from(QString::from(
+                    item.path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| item.path.display().to_string()),
+                )),
+            );
+            map.insert(
+                QString::from("isDirectory"),
+                QVariant::from(item.is_directory),
+            );
+            map.insert(
+                QString::from("status"),
+                QVariant::from(QString::from(item.status.as_str())),
+            );
+            map.insert(
+                QString::from("error"),
+                QVariant::from(QString::from(item.error)),
+            );
+            list.push(QVariant::from(map));
+        }
+        list
+    }
+
+    fn cancel_transfer_job(&mut self, id: QString) {
+        match id.to_string().parse::<u64>() {
+            Ok(id) if transfer::cancel(id) => self.refresh_transfer_jobs(),
+            _ => self.set_error("That transfer job is no longer available."),
+        }
+    }
+
+    fn cancel_pending_transfers(&mut self) {
+        transfer::cancel_pending();
+        self.refresh_transfer_jobs();
+    }
+
+    fn clear_completed_transfers(&mut self) {
+        transfer::clear_completed();
+        self.refresh_transfer_jobs();
+    }
+
+    fn retry_transfer_job(&mut self, id: QString) {
+        let Ok(id) = id.to_string().parse::<u64>() else {
+            self.set_error("That transfer job is no longer available.");
+            return;
+        };
+        let Some(job) = transfer::job(id) else {
+            self.set_error("That transfer job is no longer available.");
+            return;
+        };
+        if job.status != transfer::JobStatus::Failed {
+            self.set_error("Only failed transfer jobs can be retried.");
+            return;
+        }
+        let failed_sources = job
+            .items
+            .iter()
+            .filter(|item| {
+                item.status == transfer::ItemStatus::Failed && job.sources.contains(&item.path)
+            })
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+        let sources = if failed_sources.is_empty() {
+            job.sources.clone()
+        } else {
+            failed_sources
+        };
+        match job.operation {
+            Operation::Copy | Operation::Move => {
+                let Some(dest) = job.destination else {
+                    self.set_error("The transfer destination is no longer available.");
+                    return;
+                };
+                self.start_transfer(
+                    dest,
+                    sources,
+                    job.operation == Operation::Move,
+                    ConflictPolicy::Skip,
+                    false,
+                );
             }
-            if !outcome.failed.is_empty() {
-                message.push_str(&format!(" · {} failed", outcome.failed.len()));
+            Operation::Trash => {
+                let mut paths = QVariantList::default();
+                for path in sources {
+                    paths.push(QVariant::from(QString::from(
+                        path.to_string_lossy().into_owned(),
+                    )));
+                }
+                self.trash_paths(paths);
             }
-            let undo = if cut {
-                (!outcome.moves.is_empty()).then(|| UndoOp::Move {
-                    pairs: outcome.moves.clone(),
-                })
-            } else {
-                (!outcome.created.is_empty()).then(|| UndoOp::Copy {
-                    created: outcome.created.clone(),
-                })
-            };
-            let error = if outcome.failed.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "{} {} failed: {}",
-                    outcome.failed.len(),
-                    item_word(outcome.failed.len()),
-                    summarize_failures(&outcome.failed)
-                ))
-            };
-            tick_cb(OpTick {
-                generation,
-                detail: String::new(),
-                progress: 1.0,
-            });
-            done_cb(OpFinished {
-                generation,
-                undo,
-                message,
-                error,
-            });
-        });
+            Operation::Delete => {
+                let mut paths = QVariantList::default();
+                for path in sources {
+                    paths.push(QVariant::from(QString::from(
+                        path.to_string_lossy().into_owned(),
+                    )));
+                }
+                self.delete_paths(paths, true);
+            }
+            Operation::EmptyTrash => self.empty_trash(),
+            Operation::Restore => {
+                self.set_error("Restore jobs must be retried from the Trash view.");
+            }
+        }
     }
 
     fn apply_op_tick(&mut self, tick: OpTick) {
@@ -5171,30 +5658,6 @@ impl Backend {
         self.op_detail = QString::from(tick.detail);
         self.op_progress = tick.progress;
         self.op_changed();
-    }
-
-    fn apply_op_finished(&mut self, done: OpFinished) {
-        if done.generation != self.op_generation {
-            return;
-        }
-        self.finish_operation();
-        if let Some(undo) = done.undo {
-            self.push_undo(undo);
-        }
-        if let Some(error) = done.error {
-            self.set_error(error);
-            self.status = QString::from(done.message);
-            self.status_changed();
-        } else {
-            if let Some(tab) = self.tabs_data.get_mut(self.active) {
-                tab.error.clear();
-            }
-            self.error = QString::from("");
-            self.error_changed();
-            self.status = QString::from(done.message);
-            self.status_changed();
-        }
-        self.refresh();
     }
 
     fn push_undo(&mut self, op: UndoOp) {
@@ -5262,13 +5725,7 @@ impl Backend {
                     .unwrap_or((0, 0));
                 self.tag_store.note_move(&source, &target, dev, ino);
                 let _ = self.tag_store.save();
-                if let Some(clipboard) = &mut self.clipboard {
-                    for entry in &mut clipboard.paths {
-                        if *entry == source {
-                            *entry = target.clone();
-                        }
-                    }
-                }
+                self.update_clipboard_path(&source, &target);
                 self.push_undo(UndoOp::Rename {
                     from: source,
                     to: target,
@@ -5453,7 +5910,7 @@ impl Backend {
     }
 
     fn execute_batch_rename(&mut self, plan_id: QString) -> bool {
-        if self.op_active {
+        if self.non_transfer_operation_busy() {
             self.set_error("Wait for the current file operation to finish first.");
             return false;
         }
@@ -5622,78 +6079,118 @@ impl Backend {
             return;
         }
         let total = paths.len();
-        let generation = self.begin_operation(
-            format!("Moving {total} {} to Trash", item_word(total)),
-            true,
-        );
-        let cancel = self
-            .cancel_flag
-            .clone()
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let qptr = QPointer::from(&*self);
-        let tick_cb = qmetaobject::queued_callback(move |tick: OpTick| {
+        let done_cb = qmetaobject::queued_callback(move |done: TransferFinished| {
             if let Some(backend) = qptr.as_pinned() {
-                backend.borrow_mut().apply_op_tick(tick);
-            }
-        });
-        let qptr = QPointer::from(&*self);
-        let done_cb = qmetaobject::queued_callback(move |done: OpFinished| {
-            if let Some(backend) = qptr.as_pinned() {
-                backend.borrow_mut().apply_op_finished(done);
+                backend.borrow_mut().apply_transfer_finished(done);
             }
         });
 
-        std::thread::spawn(move || {
-            let mut items: Vec<TrashItem> = Vec::new();
-            let mut failed: Vec<(PathBuf, String)> = Vec::new();
-            let mut cancelled = false;
-            let mut last = Instant::now() - Duration::from_secs(1);
-            for (index, path) in paths.iter().enumerate() {
-                if cancel.load(Ordering::Relaxed) {
-                    cancelled = true;
-                    break;
+        let enqueue_result =
+            transfer::enqueue(Operation::Trash, paths.clone(), None, move |context| {
+                set_transfer_inventory(&context, ops::transfer_inventory(&paths));
+                let mut items: Vec<TrashItem> = Vec::new();
+                let mut failed: Vec<(PathBuf, String)> = Vec::new();
+                for path in &paths {
+                    if context.is_cancelled() {
+                        break;
+                    }
+                    context.start_item(path);
+                    match ops::trash(path) {
+                        Ok(item) => {
+                            ops::report_tree_entries(
+                                &item.file,
+                                path,
+                                ops::ItemEvent::Completed,
+                                &mut |item_path, is_directory, event| match event {
+                                    ops::ItemEvent::Started => context.start_item(item_path),
+                                    ops::ItemEvent::Completed if is_directory => {
+                                        context.finish_item(
+                                            item_path,
+                                            true,
+                                            ItemResult::Completed,
+                                            "",
+                                        );
+                                        context.finish_subtree(
+                                            item_path,
+                                            ItemResult::Completed,
+                                            "",
+                                        );
+                                    }
+                                    ops::ItemEvent::Completed => context.finish_item(
+                                        item_path,
+                                        is_directory,
+                                        ItemResult::Completed,
+                                        "",
+                                    ),
+                                    ops::ItemEvent::Skipped => context.finish_item(
+                                        item_path,
+                                        is_directory,
+                                        ItemResult::Skipped,
+                                        "",
+                                    ),
+                                    ops::ItemEvent::Cancelled => context.finish_item(
+                                        item_path,
+                                        is_directory,
+                                        ItemResult::Cancelled,
+                                        "",
+                                    ),
+                                    ops::ItemEvent::Failed(error) => context.finish_item(
+                                        item_path,
+                                        is_directory,
+                                        ItemResult::Failed,
+                                        error,
+                                    ),
+                                },
+                            );
+                            context.finish_subtree(path, ItemResult::Completed, "");
+                            items.push(item);
+                        }
+                        Err(error) => {
+                            context.finish_subtree(path, ItemResult::Failed, error.clone());
+                            failed.push((path.clone(), error));
+                        }
+                    }
                 }
-                if last.elapsed() >= Duration::from_millis(90) || index == 0 {
-                    last = Instant::now();
-                    tick_cb(OpTick {
-                        generation,
-                        detail: path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.display().to_string()),
-                        progress: index as f64 / total as f64,
-                    });
+                let cancelled = context.is_cancelled();
+                let mut message = if cancelled {
+                    format!("Cancelled: {} of {total} processed.", items.len())
+                } else {
+                    format!("Moved {} {} to Trash", items.len(), item_word(items.len()))
+                };
+                if !failed.is_empty() {
+                    message.push_str(&format!(" · {} failed", failed.len()));
                 }
-                match ops::trash(path) {
-                    Ok(item) => items.push(item),
-                    Err(error) => failed.push((path.clone(), error)),
+                let error = if failed.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} {} could not be trashed: {}",
+                        failed.len(),
+                        item_word(failed.len()),
+                        summarize_failures(&failed)
+                    ))
+                };
+                done_cb(TransferFinished {
+                    undo: (!items.is_empty()).then_some(UndoOp::Trash { items }),
+                    completed_sources: Vec::new(),
+                    from_clipboard: false,
+                    message: message.clone(),
+                    error: error.clone(),
+                });
+                if cancelled {
+                    JobResult::cancelled(message)
+                } else if let Some(error) = error {
+                    JobResult::failed(message, error)
+                } else {
+                    JobResult::completed(message)
                 }
-            }
-            let mut message = if cancelled {
-                format!("Cancelled: {} of {total} processed.", items.len())
-            } else {
-                format!("Moved {} {} to Trash", items.len(), item_word(items.len()))
-            };
-            if !failed.is_empty() {
-                message.push_str(&format!(" · {} failed", failed.len()));
-            }
-            let error = if failed.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "{} {} could not be trashed: {}",
-                    failed.len(),
-                    item_word(failed.len()),
-                    summarize_failures(&failed)
-                ))
-            };
-            done_cb(OpFinished {
-                generation,
-                undo: (!items.is_empty()).then_some(UndoOp::Trash { items }),
-                message,
-                error,
             });
-        });
+        if let Err(error) = enqueue_result {
+            self.set_error(error);
+            return;
+        }
+        self.refresh_transfer_jobs();
     }
 
     fn delete_paths(&mut self, paths: QVariantList, confirmed: bool) {
@@ -5710,77 +6207,105 @@ impl Backend {
             return;
         }
         let total = paths.len();
-        let generation = self.begin_operation(
-            format!("Permanently deleting {total} {}", item_word(total)),
-            true,
-        );
-        let cancel = self
-            .cancel_flag
-            .clone()
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let qptr = QPointer::from(&*self);
-        let tick_cb = qmetaobject::queued_callback(move |tick: OpTick| {
+        let done_cb = qmetaobject::queued_callback(move |done: TransferFinished| {
             if let Some(backend) = qptr.as_pinned() {
-                backend.borrow_mut().apply_op_tick(tick);
-            }
-        });
-        let qptr = QPointer::from(&*self);
-        let done_cb = qmetaobject::queued_callback(move |done: OpFinished| {
-            if let Some(backend) = qptr.as_pinned() {
-                backend.borrow_mut().apply_op_finished(done);
+                backend.borrow_mut().apply_transfer_finished(done);
             }
         });
 
-        std::thread::spawn(move || {
-            let mut removed = 0usize;
-            let mut failed: Vec<(PathBuf, String)> = Vec::new();
-            let mut cancelled = false;
-            for (index, path) in paths.iter().enumerate() {
-                if cancel.load(Ordering::Relaxed) {
-                    cancelled = true;
-                    break;
+        let enqueue_result =
+            transfer::enqueue(Operation::Delete, paths.clone(), None, move |context| {
+                set_transfer_inventory(&context, ops::transfer_inventory(&paths));
+                let mut removed = 0usize;
+                let mut failed: Vec<(PathBuf, String)> = Vec::new();
+                for path in &paths {
+                    if context.is_cancelled() {
+                        break;
+                    }
+                    match ops::remove_tree_detailed(
+                        path,
+                        &context.cancellation_token(),
+                        &mut |item_path, is_directory, event| match event {
+                            ops::ItemEvent::Started => context.start_item(item_path),
+                            ops::ItemEvent::Completed if is_directory => {
+                                context.finish_item(item_path, true, ItemResult::Completed, "");
+                                context.finish_subtree(item_path, ItemResult::Completed, "");
+                            }
+                            ops::ItemEvent::Completed => {
+                                context.finish_item(item_path, false, ItemResult::Completed, "")
+                            }
+                            ops::ItemEvent::Skipped => {
+                                context.finish_item(
+                                    item_path,
+                                    is_directory,
+                                    ItemResult::Skipped,
+                                    "",
+                                );
+                            }
+                            ops::ItemEvent::Cancelled => {
+                                context.finish_item(
+                                    item_path,
+                                    is_directory,
+                                    ItemResult::Cancelled,
+                                    "",
+                                );
+                            }
+                            ops::ItemEvent::Failed(error) => context.finish_item(
+                                item_path,
+                                is_directory,
+                                ItemResult::Failed,
+                                error,
+                            ),
+                        },
+                    ) {
+                        Ok(true) => removed += 1,
+                        Ok(false) => break,
+                        Err(error) => failed.push((path.clone(), error)),
+                    }
                 }
-                tick_cb(OpTick {
-                    generation,
-                    detail: path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string()),
-                    progress: index as f64 / total as f64,
+                let cancelled = context.is_cancelled();
+                let mut message = if cancelled {
+                    format!("Cancelled: {removed} of {total} deleted permanently.")
+                } else {
+                    format!(
+                        "Permanently deleted {removed} {}. This cannot be undone.",
+                        item_word(removed)
+                    )
+                };
+                if !failed.is_empty() {
+                    message.push_str(&format!(" · {} failed", failed.len()));
+                }
+                let error = if failed.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} {} could not be deleted: {}",
+                        failed.len(),
+                        item_word(failed.len()),
+                        summarize_failures(&failed)
+                    ))
+                };
+                done_cb(TransferFinished {
+                    undo: None,
+                    completed_sources: Vec::new(),
+                    from_clipboard: false,
+                    message: message.clone(),
+                    error: error.clone(),
                 });
-                match ops::remove_tree(path) {
-                    Ok(()) => removed += 1,
-                    Err(error) => failed.push((path.clone(), error)),
+                if cancelled {
+                    JobResult::cancelled(message)
+                } else if let Some(error) = error {
+                    JobResult::failed(message, error)
+                } else {
+                    JobResult::completed(message)
                 }
-            }
-            let mut message = if cancelled {
-                format!("Cancelled: {removed} of {total} deleted permanently.")
-            } else {
-                format!(
-                    "Permanently deleted {removed} {}. This cannot be undone.",
-                    item_word(removed)
-                )
-            };
-            if !failed.is_empty() {
-                message.push_str(&format!(" · {} failed", failed.len()));
-            }
-            let error = if failed.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "{} {} could not be deleted: {}",
-                    failed.len(),
-                    item_word(failed.len()),
-                    summarize_failures(&failed)
-                ))
-            };
-            done_cb(OpFinished {
-                generation,
-                undo: None,
-                message,
-                error,
             });
-        });
+        if let Err(error) = enqueue_result {
+            self.set_error(error);
+            return;
+        }
+        self.refresh_transfer_jobs();
     }
 
     fn restore_paths(&mut self, paths: QVariantList) {
@@ -5804,45 +6329,120 @@ impl Backend {
             self.set_error("Those items are no longer in the Trash.");
             return;
         }
-        let total = items.len();
-        let generation =
-            self.begin_operation(format!("Restoring {total} {}", item_word(total)), false);
         let qptr = QPointer::from(&*self);
-        let done_cb = qmetaobject::queued_callback(move |done: OpFinished| {
+        let done_cb = qmetaobject::queued_callback(move |done: TransferFinished| {
             if let Some(backend) = qptr.as_pinned() {
-                backend.borrow_mut().apply_op_finished(done);
+                backend.borrow_mut().apply_transfer_finished(done);
             }
         });
-        std::thread::spawn(move || {
-            let mut restored = 0usize;
-            let mut failed: Vec<(PathBuf, String)> = Vec::new();
-            for item in &items {
-                match ops::restore_trashed(item) {
-                    Ok(_) => restored += 1,
-                    Err(error) => failed.push((item.file.clone(), error)),
+        let paths = items
+            .iter()
+            .map(|item| item.file.clone())
+            .collect::<Vec<_>>();
+        let enqueue_result =
+            transfer::enqueue(Operation::Restore, paths.clone(), None, move |context| {
+                set_transfer_inventory(&context, ops::transfer_inventory(&paths));
+                let mut restored = 0usize;
+                let mut failed: Vec<(PathBuf, String)> = Vec::new();
+                for item in &items {
+                    if context.is_cancelled() {
+                        break;
+                    }
+                    context.start_item(&item.file);
+                    match ops::restore_trashed(item) {
+                        Ok(restored_path) => {
+                            ops::report_tree_entries(
+                                &restored_path,
+                                &item.file,
+                                ops::ItemEvent::Completed,
+                                &mut |item_path, is_directory, event| match event {
+                                    ops::ItemEvent::Started => context.start_item(item_path),
+                                    ops::ItemEvent::Completed if is_directory => {
+                                        context.finish_item(
+                                            item_path,
+                                            true,
+                                            ItemResult::Completed,
+                                            "",
+                                        );
+                                        context.finish_subtree(
+                                            item_path,
+                                            ItemResult::Completed,
+                                            "",
+                                        );
+                                    }
+                                    ops::ItemEvent::Completed => context.finish_item(
+                                        item_path,
+                                        is_directory,
+                                        ItemResult::Completed,
+                                        "",
+                                    ),
+                                    ops::ItemEvent::Skipped => context.finish_item(
+                                        item_path,
+                                        is_directory,
+                                        ItemResult::Skipped,
+                                        "",
+                                    ),
+                                    ops::ItemEvent::Cancelled => context.finish_item(
+                                        item_path,
+                                        is_directory,
+                                        ItemResult::Cancelled,
+                                        "",
+                                    ),
+                                    ops::ItemEvent::Failed(error) => context.finish_item(
+                                        item_path,
+                                        is_directory,
+                                        ItemResult::Failed,
+                                        error,
+                                    ),
+                                },
+                            );
+                            context.finish_subtree(&item.file, ItemResult::Completed, "");
+                            restored += 1;
+                        }
+                        Err(error) => {
+                            context.finish_subtree(&item.file, ItemResult::Failed, error.clone());
+                            failed.push((item.file.clone(), error));
+                        }
+                    }
                 }
-            }
-            let mut message = format!("Restored {restored} {}", item_word(restored));
-            if !failed.is_empty() {
-                message.push_str(&format!(" · {} failed", failed.len()));
-            }
-            let error = if failed.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "{} {} could not be restored: {}",
-                    failed.len(),
-                    item_word(failed.len()),
-                    summarize_failures(&failed)
-                ))
-            };
-            done_cb(OpFinished {
-                generation,
-                undo: None,
-                message,
-                error,
+                let cancelled = context.is_cancelled();
+                let mut message = format!("Restored {restored} {}", item_word(restored));
+                if cancelled {
+                    message.insert_str(0, "Cancelled: ");
+                }
+                if !failed.is_empty() {
+                    message.push_str(&format!(" · {} failed", failed.len()));
+                }
+                let error = if failed.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} {} could not be restored: {}",
+                        failed.len(),
+                        item_word(failed.len()),
+                        summarize_failures(&failed)
+                    ))
+                };
+                done_cb(TransferFinished {
+                    undo: None,
+                    completed_sources: Vec::new(),
+                    from_clipboard: false,
+                    message: message.clone(),
+                    error: error.clone(),
+                });
+                if cancelled {
+                    JobResult::cancelled(message)
+                } else if let Some(error) = error {
+                    JobResult::failed(message, error)
+                } else {
+                    JobResult::completed(message)
+                }
             });
-        });
+        if let Err(error) = enqueue_result {
+            self.set_error(error);
+            return;
+        }
+        self.refresh_transfer_jobs();
     }
 
     fn empty_trash(&mut self) {
@@ -5851,47 +6451,103 @@ impl Backend {
             return;
         }
         let root = ops::home_trash();
-        let generation = self.begin_operation("Emptying the Trash".to_owned(), true);
-        let cancel = self
-            .cancel_flag
-            .clone()
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let qptr = QPointer::from(&*self);
-        let done_cb = qmetaobject::queued_callback(move |done: OpFinished| {
+        let done_cb = qmetaobject::queued_callback(move |done: TransferFinished| {
             if let Some(backend) = qptr.as_pinned() {
-                backend.borrow_mut().apply_op_finished(done);
+                backend.borrow_mut().apply_transfer_finished(done);
             }
         });
-        std::thread::spawn(move || {
-            let (removed, failed) = ops::empty_trash(&root, &cancel);
-            let mut message = format!(
-                "Removed {removed} {} from the Trash. This cannot be undone.",
-                item_word(removed)
-            );
-            if !failed.is_empty() {
-                message.push_str(&format!(" · {} failed", failed.len()));
-            }
-            let error = if failed.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "{} {} could not be removed: {}",
-                    failed.len(),
-                    item_word(failed.len()),
-                    summarize_failures(&failed)
-                ))
-            };
-            done_cb(OpFinished {
-                generation,
-                undo: None,
-                message,
-                error,
-            });
-        });
+        let enqueue_result = transfer::enqueue(
+            Operation::EmptyTrash,
+            vec![root.clone()],
+            None,
+            move |context| {
+                let items = ops::trashed_items_in(&root);
+                let paths = items
+                    .iter()
+                    .map(|item| item.file.clone())
+                    .collect::<Vec<_>>();
+                set_transfer_inventory(&context, ops::transfer_inventory(&paths));
+                let mut removed = 0usize;
+                let mut failed = Vec::new();
+                for item in &items {
+                    if context.is_cancelled() {
+                        break;
+                    }
+                    match ops::remove_tree_detailed(
+                        &item.file,
+                        &context.cancellation_token(),
+                        &mut |path, is_directory, event| match event {
+                            ops::ItemEvent::Started => context.start_item(path),
+                            ops::ItemEvent::Completed if is_directory => {
+                                context.finish_item(path, true, ItemResult::Completed, "");
+                                context.finish_subtree(path, ItemResult::Completed, "");
+                            }
+                            ops::ItemEvent::Completed => {
+                                context.finish_item(path, false, ItemResult::Completed, "")
+                            }
+                            ops::ItemEvent::Skipped => {
+                                context.finish_item(path, is_directory, ItemResult::Skipped, "")
+                            }
+                            ops::ItemEvent::Cancelled => {
+                                context.finish_item(path, is_directory, ItemResult::Cancelled, "")
+                            }
+                            ops::ItemEvent::Failed(error) => {
+                                context.finish_item(path, is_directory, ItemResult::Failed, error)
+                            }
+                        },
+                    ) {
+                        Ok(true) => {
+                            removed += 1;
+                            let _ = fs::remove_file(&item.info);
+                        }
+                        Ok(false) => break,
+                        Err(error) => failed.push((item.file.clone(), error)),
+                    }
+                }
+                let cancelled = context.is_cancelled();
+                let mut message = format!(
+                    "Removed {removed} {} from the Trash. This cannot be undone.",
+                    item_word(removed)
+                );
+                if !failed.is_empty() {
+                    message.push_str(&format!(" · {} failed", failed.len()));
+                }
+                let error = if failed.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} {} could not be removed: {}",
+                        failed.len(),
+                        item_word(failed.len()),
+                        summarize_failures(&failed)
+                    ))
+                };
+                done_cb(TransferFinished {
+                    undo: None,
+                    completed_sources: Vec::new(),
+                    from_clipboard: false,
+                    message: message.clone(),
+                    error: error.clone(),
+                });
+                if cancelled {
+                    JobResult::cancelled(message)
+                } else if let Some(error) = error {
+                    JobResult::failed(message, error)
+                } else {
+                    JobResult::completed(message)
+                }
+            },
+        );
+        if let Err(error) = enqueue_result {
+            self.set_error(error);
+            return;
+        }
+        self.refresh_transfer_jobs();
     }
 
     fn undo(&mut self) {
-        if self.op_active {
+        if self.non_transfer_operation_busy() {
             self.set_error("Wait for the current operation to finish before undoing.");
             return;
         }
@@ -5949,7 +6605,7 @@ impl Backend {
     }
 
     fn redo(&mut self) {
-        if self.op_active {
+        if self.non_transfer_operation_busy() {
             self.set_error("Wait for the current operation to finish before redoing.");
             return;
         }
@@ -6013,6 +6669,9 @@ impl Backend {
             cancel.store(true, Ordering::Relaxed);
             self.op_detail = QString::from("Cancelling…");
             self.op_changed();
+        } else if let Some(id) = transfer::active_job_id() {
+            transfer::cancel(id);
+            self.refresh_transfer_jobs();
         }
     }
 
@@ -6143,19 +6802,49 @@ impl Backend {
     // ---- Search ---------------------------------------------------------
 
     fn set_search_recursive(&mut self, recursive: bool) {
+        self.update_search_recursive(recursive, None);
+    }
+
+    fn set_search_recursive_advanced(&mut self, query: QString, filters: QString, recursive: bool) {
+        let query = query.to_string();
+        let filters = filters.to_string();
         self.search_recursive = recursive;
         self.config.ui.search_recursive = recursive;
         self.search_changed();
         self.persist_config();
-        if self.search_mode && !self.search_query.to_string().is_empty() {
-            let query = self.search_query.to_string();
-            self.search(QString::from(query), recursive);
+        if !query.trim().is_empty() || !filters.trim().is_empty() {
+            self.search_advanced(QString::from(query), QString::from(filters), recursive);
+        }
+    }
+
+    fn update_search_recursive(&mut self, recursive: bool, filters: Option<String>) {
+        self.search_recursive = recursive;
+        self.config.ui.search_recursive = recursive;
+        self.search_changed();
+        self.persist_config();
+        if self.search_mode {
+            let (query, current_filters) = self
+                .tabs_data
+                .get(self.active)
+                .and_then(|tab| tab.search.as_ref())
+                .map(|state| (state.query.clone(), state.filters.clone()))
+                .unwrap_or_default();
+            self.search_advanced(
+                QString::from(query),
+                QString::from(filters.unwrap_or(current_filters)),
+                recursive,
+            );
         }
     }
 
     fn search(&mut self, query: QString, recursive: bool) {
+        self.search_advanced(query, QString::default(), recursive);
+    }
+
+    fn search_advanced(&mut self, query: QString, filters: QString, recursive: bool) {
         let query = query.to_string();
-        if query.trim().is_empty() {
+        let filters = filters.to_string();
+        if query.trim().is_empty() && filters.trim().is_empty() {
             self.clear_search();
             return;
         }
@@ -6168,6 +6857,7 @@ impl Backend {
         tab.cancel_search();
         tab.search = Some(SearchState {
             query: query.clone(),
+            filters,
             recursive,
             truncated: false,
             visited: 0,
@@ -6190,6 +6880,7 @@ impl Backend {
         state.generation = tab.search_generation;
         let generation = state.generation;
         let query = state.query.clone();
+        let filters = state.filters.clone();
         let recursive = state.recursive;
         let cancel = state.restart();
         let root = tab.path.clone();
@@ -6211,25 +6902,37 @@ impl Backend {
             }
         });
         std::thread::spawn(move || {
-            let outcome = if let Some(entries) = collection_entries {
-                search::search_entries(&entries, &query, &tags, &cancel, MAX_SEARCH_RESULTS)
+            let mut publish = |update| {
+                callback(SearchResult {
+                    tab_id,
+                    generation,
+                    update,
+                });
+            };
+            if let Some(entries) = collection_entries {
+                search::search_entries_with_updates(
+                    &query,
+                    &filters,
+                    &entries,
+                    &tags,
+                    &cancel,
+                    MAX_SEARCH_RESULTS,
+                    &mut publish,
+                );
             } else {
-                search::search(
+                search::search_with_updates(
                     &root,
                     &query,
+                    &filters,
                     recursive,
                     show_hidden,
                     &tags,
                     &icons,
                     &cancel,
                     MAX_SEARCH_RESULTS,
-                )
+                    &mut publish,
+                );
             };
-            callback(SearchResult {
-                tab_id,
-                generation,
-                outcome,
-            });
         });
     }
 
@@ -6237,22 +6940,56 @@ impl Backend {
         let Some(index) = self.tab_index(result.tab_id) else {
             return;
         };
-        let tab = &mut self.tabs_data[index];
-        let Some(state) = tab.search.as_ref() else {
+        let current = self.tabs_data.get(index).is_some_and(|tab| {
+            tab.search.as_ref().is_some_and(|state| {
+                state.generation == result.generation && tab.search_generation == result.generation
+            })
+        });
+        if !current {
             return;
+        }
+
+        let active = index == self.active;
+        let append = result.update.append;
+        let insert_count = if append {
+            result
+                .update
+                .hits
+                .len()
+                .min(MAX_SEARCH_RESULTS.saturating_sub(self.tabs_data[index].entries.len()))
+        } else {
+            0
         };
-        if state.generation != result.generation || tab.search_generation != result.generation {
-            return;
-        }
-        tab.search_running = false;
-        tab.entries = result.outcome.hits;
-        if let Some(state) = tab.search.as_mut() {
-            state.truncated = result.outcome.truncated;
-            state.visited = result.outcome.visited;
-        }
-        if index == self.active {
+        if active && append && insert_count > 0 {
+            let first = self.tabs_data[index].entries.len();
+            (self as &mut dyn QAbstractListModel)
+                .begin_insert_rows(first as i32, (first + insert_count - 1) as i32);
+        } else if active && !append {
             (self as &mut dyn QAbstractListModel).begin_reset_model();
+        }
+        {
+            let tab = &mut self.tabs_data[index];
+            if append {
+                let remaining = MAX_SEARCH_RESULTS.saturating_sub(tab.entries.len());
+                tab.entries
+                    .extend(result.update.hits.into_iter().take(remaining));
+            } else {
+                tab.entries = result.update.hits;
+            }
+            if let Some(state) = tab.search.as_mut() {
+                state.truncated = result.update.truncated;
+                state.visited = result.update.visited;
+            }
+            if result.update.complete {
+                tab.search_running = false;
+            }
+        }
+        if active && append && insert_count > 0 {
+            (self as &mut dyn QAbstractListModel).end_insert_rows();
+        } else if active && !append {
             (self as &mut dyn QAbstractListModel).end_reset_model();
+        }
+        if active {
             self.sync_active(false);
         }
     }
@@ -6497,7 +7234,7 @@ impl Backend {
     }
 
     fn watch_fired(&mut self, tab_id: u64, changed_directory: PathBuf) {
-        if self.op_active || self.loading {
+        if self.op_active || transfer::is_busy() || self.loading {
             return;
         }
         let Some(index) = self.tab_index(tab_id) else {
@@ -6699,11 +7436,28 @@ impl Backend {
         }
     }
 
+    fn set_transfer_error(&mut self, message: String) {
+        self.error = QString::from(message.clone());
+        self.error_changed();
+        if let Some(tab) = self.tabs_data.get_mut(self.active) {
+            tab.error = message;
+        }
+    }
+
     fn persist_config(&mut self) {
-        self.config.performance = crate::lifecycle::performance_config();
-        if let Err(error) = self.config.save() {
-            self.error = QString::from(error);
-            self.error_changed();
+        let (mut latest, warning) = Config::load();
+        if let Some(warning) = warning {
+            self.set_error(warning);
+            return;
+        }
+        latest.merge_changes_from(&self.persisted_config, &self.config);
+        latest.performance = crate::lifecycle::performance_config();
+        match latest.save() {
+            Ok(()) => {
+                self.config = latest.clone();
+                self.persisted_config = latest;
+            }
+            Err(error) => self.set_error(error),
         }
     }
 }
@@ -6748,9 +7502,52 @@ mod tests {
         backend
     }
 
+    #[test]
+    fn tab_loading_indicator_ignores_same_path_refreshes() {
+        let path = PathBuf::from("/tmp/empty-folder");
+        let mut tab = Tab::new(1, path.clone(), SortSpec::default());
+
+        tab.loading = true;
+        assert!(tab.shows_loading_indicator());
+
+        tab.loaded_path = Some(path.clone());
+        assert!(!tab.shows_loading_indicator());
+
+        tab.path = PathBuf::from("/tmp/another-folder");
+        assert!(tab.shows_loading_indicator());
+
+        tab.loading = false;
+        assert!(!tab.shows_loading_indicator());
+    }
+
+    #[test]
+    fn separate_backends_sync_the_process_clipboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        fs::write(&source, "clipboard").unwrap();
+        publish_shared_clipboard(Some(Clipboard {
+            paths: vec![source.clone()],
+            cut: true,
+        }));
+
+        let mut destination_backend = Backend::default();
+        destination_backend.refresh_shared_clipboard_state();
+
+        assert_eq!(destination_backend.clipboard_count, 1);
+        assert!(destination_backend.clipboard_cut);
+        assert_eq!(
+            QString::from_qvariant(destination_backend.clipboard_paths[0].clone())
+                .unwrap()
+                .to_string(),
+            source.to_string_lossy()
+        );
+        publish_shared_clipboard(None);
+    }
+
     fn test_search_state(generation: u64) -> SearchState {
         SearchState {
             query: "needle".to_owned(),
+            filters: String::new(),
             recursive: false,
             truncated: false,
             visited: 0,
@@ -6784,13 +7581,45 @@ mod tests {
         SearchResult {
             tab_id,
             generation,
-            outcome: search::SearchOutcome {
+            update: search::SearchUpdate {
                 hits: vec![test_entry(name)],
+                append: false,
+                complete: true,
                 truncated: false,
-                cancelled: false,
                 visited: 1,
             },
         }
+    }
+
+    #[test]
+    fn partial_search_results_append_while_search_remains_active() {
+        let mut backend = test_backend_with_tabs();
+        let tab = &mut backend.tabs_data[0];
+        tab.search = Some(test_search_state(1));
+        tab.search_generation = 1;
+        tab.search_running = true;
+        backend.sync_active(false);
+
+        backend.apply_search_result(SearchResult {
+            tab_id: 1,
+            generation: 1,
+            update: search::SearchUpdate {
+                hits: vec![test_entry("first.txt")],
+                append: true,
+                complete: false,
+                truncated: false,
+                visited: 32,
+            },
+        });
+
+        assert!(backend.searching);
+        assert!(backend.tabs_data[0].search_running);
+        assert_eq!(backend.tabs_data[0].entries[0].name, "first.txt");
+
+        backend.apply_search_result(test_search_result(1, 1, "ranked.txt"));
+        assert!(!backend.searching);
+        assert_eq!(backend.tabs_data[0].entries.len(), 1);
+        assert_eq!(backend.tabs_data[0].entries[0].name, "ranked.txt");
     }
 
     #[test]

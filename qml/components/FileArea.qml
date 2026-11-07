@@ -91,9 +91,18 @@ Item {
     property string lastViewMode: backend ? backend.view_mode : ""
     property string pendingStartPath: ""
     property var pendingScrollRestore: null
+    property bool emptyStateReady: false
+    property string emptyStatePath: ""
+    property int emptyStateTabId: -1
 
-    property var cutMap: ({})
+    property var clipboardMap: ({})
     property var dragSession: null
+    property var dragMimeData: ({})
+    property bool nativeDragUsed: false
+    property bool nativeDragRequested: false
+    // Set while a drag survives a hover-driven navigation into a folder; the
+    // rescue overlay takes over pointer tracking for the rest of the session.
+    property bool dragCrossedNavigation: false
     readonly property var dragPaths: dragSession ? dragSession.paths : []
     property string dragHoverPath: ""
     readonly property bool dragActive: dragSession !== null && dragSession.valid
@@ -115,6 +124,7 @@ Item {
 
     signal requestTrash()
     signal requestPermanentDelete()
+
     signal requestNewFolder()
     signal requestNewFile()
     signal requestBatchRename()
@@ -126,11 +136,81 @@ Item {
     signal requestCompress(var paths)
     signal requestSearch(string query)
 
+    Item {
+        id: dragSource
+        objectName: "fileDragSource"
+        width: 48
+        height: 48
+        x: root.dragPointer.x - width / 2
+        y: root.dragPointer.y - height / 2
+        z: -1
+        visible: root.dragActive
+
+        Drag.active: root.dragActive
+        Drag.dragType: Drag.None
+        Drag.keys: ["text/uri-list", "filem/paths"]
+        Drag.mimeData: root.dragMimeData
+        Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
+        Drag.proposedAction: root.dragCopy ? Qt.CopyAction : Qt.MoveAction
+        Drag.hotSpot.x: width / 2
+        Drag.hotSpot.y: height / 2
+        Drag.imageSource: root.dragImageSource
+        Drag.imageSourceSize: Qt.size(width, height)
+        Drag.onDragStarted: {
+            console.warn("NATIVE drag started", root.dragPaths.length)
+            root.nativeDragUsed = true
+            dragCancelTimer.stop()
+            dragCancelTimer.sessionPaths = null
+        }
+        Drag.onDragFinished: function(drop) {
+            console.warn("NATIVE finished", drop ? drop.action : -1,
+                         drop ? drop.accepted : "?", "buttons", dragSource.Drag.active)
+            root.finishDrag()
+        }
+    }
+
+    Timer {
+        id: dragCancelTimer
+        interval: 120
+        repeat: false
+        property var sessionPaths: null
+
+        onTriggered: {
+            var paths = sessionPaths
+            sessionPaths = null
+            if (root.dragActive && root.dragPaths === paths && !root.nativeDragUsed) {
+                if (root.dragCrossedNavigation) {
+                    // The hover navigation reset the listing; the session
+                    // continues under dragRescueOverlay, so don't tear it down.
+                    return
+                }
+                root.finishDrag()
+            }
+        }
+    }
+
     Timer {
         id: mouseSelectionUpdate
         interval: 16
         repeat: false
         onTriggered: root.updateMouseSelection()
+    }
+
+    // After a hover-driven navigation mid-drag the original row MouseArea is
+    // destroyed with the old listing, so this overlay inherits the grab and
+    // keeps feeding the shared drag pipeline until the item is released.
+    MouseArea {
+        id: dragRescueOverlay
+        anchors.fill: parent
+        z: 90
+        enabled: root.dragActive && root.dragCrossedNavigation
+        hoverEnabled: true
+        onPositionChanged: function(mouse) {
+            root.updateDragPointer(mouse.x, mouse.y)
+        }
+        onReleased: function(mouse) {
+            root.finishPointerDrag(mouse.x, mouse.y)
+        }
     }
 
     Timer {
@@ -140,8 +220,16 @@ Item {
         onTriggered: {
             var path = root.hoverNavigationPath
             root.hoverNavigationPath = ""
-            if (path !== "" && root.backend && path !== root.backend.current_path)
+            if (path !== "" && root.backend && path !== root.backend.current_path) {
+                if (root.dragActive) {
+                    // Keep the drag alive across the directory change instead
+                    // of dropping the carried selection when the model resets.
+                    root.dragCrossedNavigation = true
+                }
                 root.backend.navigate(path)
+                if (root.dragActive)
+                    dragRescueOverlay.grabMouse()
+            }
         }
     }
 
@@ -265,10 +353,40 @@ Item {
         return paths
     }
 
-    function beginDrag(paths, modifiers, imageSource) {
-        if (!paths || paths.length === 0)
+    function isMarqueeStart(x, y, width, height) {
+        return x < 6 || x > width - 6 || y < 6 || y > height - 6
+    }
+
+    function beginDrag(itemPath, modifiers, imageSource, pointer) {
+        console.warn("AREA beginDrag", itemPath, root.dragPaths.length)
+        if (!itemPath)
             return
-        var sourcePaths = paths.slice()
+        dragCancelTimer.stop()
+        dragCancelTimer.sessionPaths = null
+        var selected = root.selectedPaths()
+        var sourcePaths = []
+        var seen = ({})
+        for (var i = 0; i < selected.length; i++) {
+            var path = selected[i]
+            if (!seen[path]) {
+                seen[path] = true
+                sourcePaths.push(path)
+            }
+        }
+        if (sourcePaths.indexOf(itemPath) < 0)
+            sourcePaths = [itemPath]
+        if (sourcePaths.length === 0)
+            return
+
+        root.dragMimeData = {
+            "text/uri-list": root.backend ? root.backend.paths_uri_list(sourcePaths) : "",
+            "filem/paths": sourcePaths.join("\n")
+        }
+        root.nativeDragUsed = false
+        root.nativeDragRequested = false
+        root.dragPointer = pointer || Qt.point(0, 0)
+        root.dragImageSource = imageSource || ""
+        root.dragHoverPath = ""
         root.dragSession = {
             paths: sourcePaths,
             selection: sourcePaths.slice(),
@@ -280,8 +398,39 @@ Item {
             consumed: false,
             valid: true
         }
-        root.dragImageSource = imageSource || ""
-        root.dragHoverPath = ""
+        // The native drag system grabs the pointer and stops delivering move
+        // events back to the originating MouseArea, which would freeze the drag
+        // ghost and lose same-window drop handling. The QML pointer pipeline
+        // drives everything inside this window; the drag only goes native in
+        // startNativeDrag() when the pointer actually leaves it.
+    }
+
+    function startNativeDrag() {
+        if (!root.dragActive || root.nativeDragUsed || root.nativeDragRequested || !root.backend)
+            return
+        root.nativeDragRequested = true
+        dragCancelTimer.stop()
+        dragCancelTimer.sessionPaths = null
+        Qt.callLater(function() {
+            if (root.dragActive && !root.nativeDragUsed)
+                dragSource.Drag.startDrag(Qt.CopyAction | Qt.MoveAction)
+        })
+    }
+
+    readonly property Item overlayRoot: {
+        var top = root
+        while (top.parent)
+            top = top.parent
+        return top
+    }
+
+    function pointerLeavesWindow(x, y) {
+        var topItem = root.overlayRoot
+        if (!topItem)
+            return false
+        var mapped = root.mapToItem(topItem, x, y)
+        return mapped.x < 0 || mapped.y < 0
+               || mapped.x > topItem.width || mapped.y > topItem.height
     }
 
     function resolveMainDropTarget(x, y) {
@@ -326,6 +475,10 @@ Item {
         root.dragPointer = Qt.point(x, y)
         if (!root.dragActive)
             return
+        if (root.pointerLeavesWindow(x, y)) {
+            root.startNativeDrag()
+            return
+        }
         var destination = root.resolveDropTarget(x, y)
         if (destination !== "" && destination !== root.backend.current_path) {
             if (root.dragHoverPath !== destination) {
@@ -347,6 +500,20 @@ Item {
         if (destination !== "")
             root.dropDraggedPaths(destination, root.dragCopy ? Qt.CopyAction : Qt.MoveAction)
         root.finishDrag()
+    }
+
+    function finishPointerDrag(x, y) {
+        console.warn("DRAG finishPointerDrag", x, y, root.dragActive, "native", root.nativeDragUsed)
+        if (!root.dragActive)
+            return
+        if (root.nativeDragUsed)
+            return
+        root.finishInternalDrag(x, y)
+    }
+
+    function cancelPointerDrag() {
+        dragCancelTimer.sessionPaths = root.dragPaths
+        dragCancelTimer.restart()
     }
 
     function beginFolderHover(path) {
@@ -386,9 +553,15 @@ Item {
         var session = root.dragSession
         var clearDraggedSelection = session && root.backend
                 && (session.consumed || root.backend.current_path !== session.sourceDirectory)
+        dragCancelTimer.stop()
+        dragCancelTimer.sessionPaths = null
         hoverNavigationTimer.stop()
         root.hoverNavigationPath = ""
         root.dragSession = null
+        root.dragMimeData = ({})
+        root.nativeDragUsed = false
+        root.nativeDragRequested = false
+        root.dragCrossedNavigation = false
         root.dragHoverPath = ""
         root.dragImageSource = ""
         root.dragPointer = Qt.point(-1, -1)
@@ -398,6 +571,7 @@ Item {
     }
 
     function dropDraggedPaths(dest, proposedAction) {
+        console.warn("DROP dropDraggedPaths", dest, proposedAction)
         var session = root.dragSession
         if (!backend || !dest || dest === "" || !session || !session.valid
                 || session.paths.length === 0 || session.consumed)
@@ -421,6 +595,8 @@ Item {
     }
 
     function dropExternalPaths(drop, dest) {
+        console.warn("RECV external", dest,
+                     drop && drop.proposedAction, drop && drop.urls ? drop.urls.length : -1)
         if (!backend || !dest || dest === "" || !drop || !drop.urls || drop.urls.length === 0)
             return false
         var urls = []
@@ -434,8 +610,8 @@ Item {
         return selection[path] === true
     }
 
-    function isCut(path) {
-        return backend && backend.clipboard_cut && cutMap[path] === true
+    function isClipboardItem(path) {
+        return clipboardMap[path] === true
     }
 
     function updateStats() {
@@ -1045,6 +1221,7 @@ Item {
                     z: -1
                     keys: ["text/uri-list", "filem/paths"]
                     onEntered: {
+                        console.warn("RECV bg entered list")
                         if (root.dragActive && root.backend)
                             root.setDragHoverPath(root.backend.current_path)
                     }
@@ -1054,6 +1231,7 @@ Item {
                             root.setDragHoverPath("")
                     }
                     onDropped: function(drop) {
+                        console.warn("DROP LIST DropArea", drop.proposedAction)
                         if (root.dragActive) {
                             if (root.dropDraggedPaths(root.backend.current_path, drop.proposedAction))
                                 drop.acceptProposedAction()
@@ -1219,6 +1397,7 @@ Item {
                         z: -1
                         keys: ["text/uri-list", "filem/paths"]
                         onEntered: {
+                            console.warn("RECV bg entered column")
                             if (root.backend && root.dragActive)
                                 root.setDragHoverPath(root.backend.current_path)
                         }
@@ -1228,6 +1407,7 @@ Item {
                                 root.setDragHoverPath("")
                         }
                         onDropped: function(drop) {
+                            console.warn("DROP COLUMN DropArea", drop.proposedAction)
                             if (!root.backend)
                                 return
                             if (root.dragActive) {
@@ -1384,12 +1564,14 @@ Item {
                                                && gridView.currentIndex === index
                     property bool gridDragged: root.dragActive
                                                && root.dragPaths.indexOf(model.path) >= 0
+                    property bool clipboardItem: root.isClipboardItem(model.path)
                     property bool dragTarget: model.isDir
                                               && ((root.dragActive
                                                    && root.dragHoverPath === model.path)
                                                   || gridDropArea.containsDrag)
                     property bool gridHovered: gridMouse.containsMouse && !gridSelected
                     property string entryPath: model.path
+                    readonly property var entryTags: model.tags || []
                     property bool imageThumbnail: [
                         "png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "tif", "tiff", "avif", "ico",
                         "heic", "heif", "jxl", "tga", "jp2", "j2k"
@@ -1505,6 +1687,14 @@ Item {
                         anchors.topMargin: 6
                         anchors.bottomMargin: 6
                         spacing: 1
+                        opacity: gridDelegate.clipboardItem ? 0.52 : 1
+
+                        Behavior on opacity {
+                            NumberAnimation {
+                                duration: 160
+                                easing.type: Easing.InOutCubic
+                            }
+                        }
 
                         Item {
                             width: parent.width
@@ -1520,7 +1710,7 @@ Item {
                                 sourceSize.width: width
                                 sourceSize.height: height
                                 asynchronous: true
-                                cache: true
+                                cache: false
                             }
                         }
 
@@ -1552,6 +1742,32 @@ Item {
                             Accessible.name: model.name || ""
                         }
 
+                    }
+
+                    Row {
+                        objectName: "gridTagIndicators"
+                        anchors.left: cardBackground.left
+                        anchors.top: cardBackground.top
+                        anchors.leftMargin: 8
+                        anchors.topMargin: 8
+                        spacing: 3
+                        z: 2
+                        visible: gridDelegate.entryTags.length > 0
+
+                        Repeater {
+                            model: gridDelegate.entryTags
+                            delegate: Rectangle {
+                                required property var modelData
+                                width: 10
+                                height: 10
+                                radius: 5
+                                color: root.theme
+                                       ? root.theme.tag_color(modelData) : "#9299a8"
+                                border.width: 1
+                                border.color: root.theme
+                                             ? root.theme.surface : "#151820"
+                            }
+                        }
                     }
 
                     DropArea {
@@ -1612,7 +1828,8 @@ Item {
                             pressModifiers = mouse.modifiers
                             dragOrigin = Qt.point(mouse.x, mouse.y)
                             pressedSelected = root.isSelected(model.path)
-                            isMarqueeGesture = !pressedSelected && (mouse.x < 6 || mouse.x > width - 6 || mouse.y < 6 || mouse.y > height - 6)
+                            isMarqueeGesture = !pressedSelected
+                                    && root.isMarqueeStart(mouse.x, mouse.y, width, height)
 
                             gridView.currentIndex = index
                             gridView.forceActiveFocus()
@@ -1648,16 +1865,13 @@ Item {
                                 return
                             }
 
+                            var areaPoint = mapToItem(root, mouse.x, mouse.y)
                             if (!dragStarted) {
                                 dragStarted = true
-                                var paths = root.selectedPaths()
-                                if (paths.indexOf(model.path) < 0)
-                                    paths = [model.path]
-                                root.beginDrag(paths, pressModifiers, model.iconUrl)
+                                root.beginDrag(model.path, pressModifiers, model.iconUrl, areaPoint)
                             }
 
                             if (root.dragActive) {
-                                var areaPoint = mapToItem(root, mouse.x, mouse.y)
                                 root.updateDragPointer(areaPoint.x, areaPoint.y)
                             }
                         }
@@ -1693,7 +1907,7 @@ Item {
                                 dragStarted = false
                                 if (root.dragActive) {
                                     var areaPoint = mapToItem(root, mouse.x, mouse.y)
-                                    root.finishInternalDrag(areaPoint.x, areaPoint.y)
+                                    root.finishPointerDrag(areaPoint.x, areaPoint.y)
                                 }
                                 dragOrigin = Qt.point(0, 0)
                                 return
@@ -1721,7 +1935,7 @@ Item {
                                 isMarqueeGesture = false
                             } else if (dragStarted) {
                                 dragStarted = false
-                                root.finishDrag()
+                                root.cancelPointerDrag()
                             }
                             dragOrigin = Qt.point(0, 0)
                         }
@@ -1754,6 +1968,7 @@ Item {
                     z: -1
                     keys: ["text/uri-list", "filem/paths"]
                     onEntered: {
+                        console.warn("RECV bg entered grid")
                         if (root.dragActive && root.backend)
                             root.setDragHoverPath(root.backend.current_path)
                     }
@@ -1763,6 +1978,7 @@ Item {
                             root.setDragHoverPath("")
                     }
                     onDropped: function(drop) {
+                        console.warn("DROP GRID DropArea", drop.proposedAction)
                         if (root.dragActive) {
                             if (root.dropDraggedPaths(
                                         root.backend.current_path, drop.proposedAction))
@@ -2058,12 +2274,13 @@ Item {
             }
 
             Text {
+                objectName: "emptyFolderMessage"
                 anchors.centerIn: parent
                 width: Math.min(parent.width - 48, 460)
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode: Text.WordWrap
                 visible: root.backend
-                         && !root.backend.loading
+                         && root.emptyStateReady
                          && root.backend.item_count === 0
                          && root.backend.error === ""
                 text: root.backend && root.backend.search_mode
@@ -2104,6 +2321,10 @@ Item {
             if (!root.backend)
                 return
             var path = root.backend.current_path
+            if (path !== root.emptyStatePath) {
+                root.emptyStatePath = path
+                root.emptyStateReady = false
+            }
             if (path === root.lastPath)
                 return
             root.lastPath = path
@@ -2126,6 +2347,11 @@ Item {
         }
 
         function onLoading_changed() {
+            if (root.backend && !root.backend.loading) {
+                root.emptyStatePath = root.backend.current_path
+                root.emptyStateTabId = root.backend.active_tab_id
+                root.emptyStateReady = true
+            }
             root.finishPendingScrollPositioning()
         }
 
@@ -2158,7 +2384,33 @@ Item {
         function onTabs_changed() {
             if (!root.backend)
                 return
+            // Prune tabState entries for tabs that no longer exist so the map
+            // does not grow unbounded over a long session.
+            var activeIds = ({})
+            var tabs = root.backend.tabs || []
+            for (var i = 0; i < tabs.length; i++) {
+                var t = tabs[i]
+                var key = (t && t.id !== undefined) ? String(t.id) : String(i)
+                activeIds[key] = true
+            }
+            var next = {}
+            var changed = false
+            for (var key in root.tabState) {
+                if (activeIds[key]) {
+                    next[key] = root.tabState[key]
+                } else {
+                    changed = true
+                }
+            }
+            if (changed)
+                root.tabState = next
+
             var id = root.backend.active_tab_id
+            if (id !== root.emptyStateTabId) {
+                root.emptyStateTabId = id
+                root.emptyStatePath = root.backend.current_path
+                root.emptyStateReady = !root.backend.loading
+            }
             if (id === root.boundTabId)
                 return
             root.boundTabId = id
@@ -2167,12 +2419,12 @@ Item {
 
         function onClipboard_changed() {
             var map = {}
-            if (root.backend && root.backend.clipboard_cut) {
+            if (root.backend) {
                 var paths = root.backend.clipboard_paths
                 for (var i = 0; i < paths.length; i++)
                     map[paths[i]] = true
             }
-            root.cutMap = map
+            root.clipboardMap = map
         }
 
         function onRenaming_changed() {
@@ -2184,7 +2436,8 @@ Item {
     Item {
         id: dragGhost
         z: 100
-        visible: root.dragActive && root.dragPointer.x >= 0 && root.dragPointer.y >= 0
+        visible: root.dragActive && !root.nativeDragUsed
+                 && root.dragPointer.x >= 0 && root.dragPointer.y >= 0
         x: Math.max(0, Math.min(root.width - width, root.dragPointer.x + 14))
         y: Math.max(0, Math.min(root.height - height, root.dragPointer.y + 14))
 
@@ -2236,6 +2489,9 @@ Item {
         if (root.backend) {
             root.boundTabId = root.backend.active_tab_id
             root.lastPath = root.backend.current_path
+            root.emptyStatePath = root.backend.current_path
+            root.emptyStateTabId = root.backend.active_tab_id
+            root.emptyStateReady = !root.backend.loading
             root.restoreTab(root.boundTabId)
         }
     }

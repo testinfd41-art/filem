@@ -14,6 +14,7 @@ mod store;
 mod sysclip;
 mod tags;
 mod theme;
+mod transfer;
 mod volumes;
 
 use std::path::PathBuf;

@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,7 +30,29 @@ fn cache_clear_message() -> &'static Mutex<String> {
 
 fn performance_state() -> &'static Mutex<PerformanceConfig> {
     static PERFORMANCE: OnceLock<Mutex<PerformanceConfig>> = OnceLock::new();
-    PERFORMANCE.get_or_init(|| Mutex::new(Config::load().0.performance))
+    PERFORMANCE.get_or_init(|| Mutex::new(normalize_performance(Config::load().0.performance)))
+}
+
+fn normalize_performance(mut settings: PerformanceConfig) -> PerformanceConfig {
+    if !matches!(
+        settings.background_idle_timeout_seconds,
+        0 | 5 | 10 | 30 | 60 | 300
+    ) {
+        settings.background_idle_timeout_seconds = 30;
+    }
+    if !matches!(
+        settings.startup_behavior.as_str(),
+        "balanced" | "fast_reopen" | "low_memory"
+    ) {
+        settings.startup_behavior = "balanced".to_owned();
+    }
+    if !matches!(
+        settings.thumbnail_cache_limit_mb,
+        128 | 256 | 512 | 1024 | 2048
+    ) {
+        settings.thumbnail_cache_limit_mb = 512;
+    }
+    settings
 }
 
 pub fn performance_config() -> PerformanceConfig {
@@ -69,12 +91,65 @@ fn window_state() -> &'static Mutex<WindowState> {
     STATE.get_or_init(|| Mutex::new(WindowState::default()))
 }
 
+impl WindowState {
+    fn opened(&mut self) {
+        self.visible_windows = self.visible_windows.saturating_add(1);
+        self.idle_since = None;
+    }
+
+    fn closed(&mut self, now: Instant) {
+        self.visible_windows = self.visible_windows.saturating_sub(1);
+        if self.visible_windows == 0 {
+            self.idle_since = Some(now);
+        }
+    }
+
+    fn should_exit(&mut self, performance: &PerformanceConfig, now: Instant) -> bool {
+        if self.visible_windows > 0 {
+            return false;
+        }
+        if !performance.keep_running_background {
+            return true;
+        }
+        if performance.background_idle_timeout_seconds == 0 {
+            return false;
+        }
+        let idle_since = *self.idle_since.get_or_insert(now);
+        now.saturating_duration_since(idle_since)
+            >= Duration::from_secs(u64::from(performance.background_idle_timeout_seconds))
+    }
+}
+
+fn ipc_directory() -> PathBuf {
+    PathBuf::from(format!("/tmp/filem-{}", unsafe { libc::geteuid() }))
+}
+
 fn ipc_socket_path() -> PathBuf {
-    PathBuf::from(format!("/tmp/filem-{}.sock", unsafe { libc::geteuid() }))
+    ipc_directory().join("instance.sock")
 }
 
 fn ipc_lock_path() -> PathBuf {
-    PathBuf::from(format!("/tmp/filem-{}.lock", unsafe { libc::geteuid() }))
+    ipc_directory().join("instance.lock")
+}
+
+fn prepare_ipc_directory(directory: &Path) -> Result<(), String> {
+    match fs::create_dir(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!("Could not create {}: {error}", directory.display()));
+        }
+    }
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("Could not inspect {}: {error}", directory.display()))?;
+    if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "Refusing to use unsafe IPC directory {}",
+            directory.display()
+        ));
+    }
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("Could not secure {}: {error}", directory.display()))
 }
 
 /// Holds the per-user advisory lock for as long as this process owns IPC.
@@ -86,7 +161,15 @@ pub struct InstanceGuard {
 impl InstanceGuard {
     /// Returns `Ok(None)` when an existing process accepted the launch request.
     pub fn acquire(initial_path: &str) -> Result<Option<Self>, String> {
-        let lock_path = ipc_lock_path();
+        prepare_ipc_directory(&ipc_directory())?;
+        Self::acquire_at(initial_path, ipc_lock_path(), ipc_socket_path())
+    }
+
+    fn acquire_at(
+        initial_path: &str,
+        lock_path: PathBuf,
+        socket_path: PathBuf,
+    ) -> Result<Option<Self>, String> {
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -95,9 +178,22 @@ impl InstanceGuard {
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(&lock_path)
             .map_err(|error| format!("Could not open {}: {error}", lock_path.display()))?;
+        if lock
+            .metadata()
+            .map_err(|error| format!("Could not inspect {}: {error}", lock_path.display()))?
+            .uid()
+            != unsafe { libc::geteuid() }
+        {
+            return Err(format!(
+                "IPC lock {} is not owned by this user",
+                lock_path.display()
+            ));
+        }
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("Could not secure {}: {error}", lock_path.display()))?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
-                forward_open_request(initial_path)?;
+                forward_open_request(initial_path, &socket_path)?;
                 return Ok(None);
             }
             return Err(format!(
@@ -107,7 +203,6 @@ impl InstanceGuard {
             ));
         }
 
-        let socket_path = ipc_socket_path();
         match fs::symlink_metadata(&socket_path) {
             Ok(metadata)
                 if metadata.file_type().is_socket()
@@ -167,13 +262,12 @@ impl Drop for InstanceGuard {
     }
 }
 
-fn forward_open_request(path: &str) -> Result<(), String> {
+fn forward_open_request(path: &str, socket_path: &PathBuf) -> Result<(), String> {
     let payload = serde_json::to_string(path)
         .map_err(|error| format!("Could not encode open request: {error}"))?;
-    let socket_path = ipc_socket_path();
     let mut last_error = None;
     for _ in 0..50 {
-        match UnixStream::connect(&socket_path) {
+        match UnixStream::connect(socket_path) {
             Ok(mut stream) => {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(1)))
@@ -294,8 +388,7 @@ impl Lifecycle {
         let mut state = window_state()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.visible_windows = state.visible_windows.saturating_add(1);
-        state.idle_since = None;
+        state.opened();
     }
 
     fn window_closed(&mut self) {
@@ -303,9 +396,8 @@ impl Lifecycle {
         let mut state = window_state()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.visible_windows = state.visible_windows.saturating_sub(1);
+        state.closed(Instant::now());
         if state.visible_windows == 0 {
-            state.idle_since = Some(Instant::now());
             if low_memory {
                 crate::metadata::clear_cache();
                 crate::icons::clear_shared_cache();
@@ -318,17 +410,7 @@ impl Lifecycle {
         let mut state = window_state()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.visible_windows > 0 {
-            return false;
-        }
-        if !performance.keep_running_background {
-            return true;
-        }
-        if performance.background_idle_timeout_seconds == 0 {
-            return false;
-        }
-        state.idle_since.get_or_insert_with(Instant::now).elapsed()
-            >= Duration::from_secs(u64::from(performance.background_idle_timeout_seconds))
+        state.should_exit(&performance, Instant::now())
     }
 
     fn set_keep_running_background(&mut self, enabled: bool) {
@@ -431,5 +513,110 @@ mod tests {
         assert_eq!(u64::from(0_u32), 0);
         assert_eq!(Duration::from_secs(5).as_secs(), 5);
         assert_eq!(Duration::from_secs(300).as_secs(), 300);
+    }
+
+    #[test]
+    fn window_counts_keep_idle_from_starting_until_the_last_close() {
+        let now = Instant::now();
+        let mut state = WindowState::default();
+        state.opened();
+        state.opened();
+        state.closed(now);
+        assert_eq!(state.visible_windows, 1);
+        assert!(state.idle_since.is_none());
+        state.closed(now);
+        assert_eq!(state.visible_windows, 0);
+        assert_eq!(state.idle_since, Some(now));
+    }
+
+    #[test]
+    fn reopening_during_keepalive_cancels_the_idle_deadline() {
+        let closed_at = Instant::now();
+        let mut state = WindowState {
+            visible_windows: 0,
+            idle_since: Some(closed_at),
+        };
+        let mut settings = PerformanceConfig::default();
+        settings.background_idle_timeout_seconds = 5;
+        state.opened();
+        assert!(!state.should_exit(&settings, closed_at + Duration::from_secs(10)));
+        state.closed(closed_at + Duration::from_secs(10));
+        assert!(!state.should_exit(&settings, closed_at + Duration::from_secs(14)));
+        assert!(state.should_exit(&settings, closed_at + Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn idle_timeout_and_until_logout_follow_settings() {
+        let start = Instant::now();
+        let mut state = WindowState {
+            visible_windows: 0,
+            idle_since: Some(start),
+        };
+        let mut settings = PerformanceConfig::default();
+        settings.background_idle_timeout_seconds = 5;
+        assert!(!state.should_exit(&settings, start + Duration::from_secs(4)));
+        assert!(state.should_exit(&settings, start + Duration::from_secs(5)));
+        settings.background_idle_timeout_seconds = 0;
+        assert!(!state.should_exit(&settings, start + Duration::from_secs(600)));
+        settings.keep_running_background = false;
+        assert!(state.should_exit(&settings, start));
+        state.visible_windows = 1;
+        assert!(!state.should_exit(&settings, start));
+    }
+
+    #[test]
+    fn second_launch_is_forwarded_to_the_locked_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join("filem.lock");
+        let socket_path = directory.path().join("filem.sock");
+        pending_open_requests().lock().unwrap().clear();
+        let primary = InstanceGuard::acquire_at("", lock_path.clone(), socket_path.clone())
+            .unwrap()
+            .unwrap();
+        assert!(
+            InstanceGuard::acquire_at("/tmp/Folder With Spaces", lock_path, socket_path,)
+                .unwrap()
+                .is_none()
+        );
+        for _ in 0..50 {
+            if !pending_open_requests().lock().unwrap().is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            pending_open_requests()
+                .lock()
+                .unwrap()
+                .pop_front()
+                .as_deref(),
+            Some("/tmp/Folder With Spaces")
+        );
+        drop(primary);
+    }
+
+    #[test]
+    fn stale_owned_socket_is_replaced_but_regular_files_are_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join("filem.lock");
+        let socket_path = directory.path().join("filem.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+        assert!(fs::symlink_metadata(&socket_path)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        let primary = InstanceGuard::acquire_at("", lock_path.clone(), socket_path.clone())
+            .unwrap()
+            .unwrap();
+        assert!(fs::symlink_metadata(&socket_path)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        drop(primary);
+
+        fs::write(&socket_path, b"preserve").unwrap();
+        assert!(InstanceGuard::acquire_at("", lock_path, socket_path.clone()).is_err());
+        assert_eq!(fs::read(socket_path).unwrap(), b"preserve");
     }
 }

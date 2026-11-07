@@ -10,6 +10,7 @@ TestCase {
 
     QtObject {
         id: fakeTheme
+        signal changed()
         property string mode: "dark"
         property string font_family: "Ubuntu Sans"
         property real font_size: 12
@@ -71,6 +72,16 @@ TestCase {
         compare(fakeTheme.lastValue, "18")
     }
 
+    function test_tag_color_field_preserves_text_while_editing() {
+        var field = findChild(dialog, "color_tag3")
+        verify(field !== null)
+        field.forceActiveFocus()
+        field.text = "#123456"
+        fakeTheme.tag3 = "#654321"
+        fakeTheme.changed()
+        compare(field.text, "#123456")
+    }
+
     function test_primary_controls_are_available() {
         verify(findChild(dialog, "appearanceMode") === null)
         verify(findChild(dialog, "appearanceFont") !== null)
@@ -85,6 +96,13 @@ TestCase {
         tryCompare(fontControl.popup, "visible", true)
         verify(fontControl.popup.height <= 282)
         fontControl.popup.close()
+    }
+
+    function test_escape_closes_appearance_dialog() {
+        dialog.open = true
+        dialog.forceActiveFocus()
+        keyClick(Qt.Key_Escape)
+        tryCompare(dialog, "open", false)
     }
 
 }

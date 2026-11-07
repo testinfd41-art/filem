@@ -776,6 +776,10 @@ pub fn trim_thumbnail_cache(cache_dir: &Path, force: bool) {
 
     let limit_mb = crate::lifecycle::performance_config().thumbnail_cache_limit_mb;
     let limit_bytes = u64::from(limit_mb.clamp(64, 4096)) * 1024 * 1024;
+    enforce_thumbnail_cache_limit_to(cache_dir, limit_bytes);
+}
+
+fn enforce_thumbnail_cache_limit_to(cache_dir: &Path, limit_bytes: u64) {
     let mut files = filem_thumbnail_files(cache_dir);
     let mut total = files.iter().map(|(_, size, _)| *size).sum::<u64>();
     if total <= limit_bytes {
@@ -1291,6 +1295,29 @@ mod tests {
         fs::write(&source, b"changed source").unwrap();
         assert!(!thumbnail_cache_valid(&cached, &source));
         assert!(cached_thumbnail_in(&cache, &source).is_none());
+    }
+
+    #[test]
+    fn thumbnail_limit_and_clear_only_remove_filem_owned_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("photo.jpg");
+        let cache = dir.path().join("cache");
+        fs::write(&source, b"source").unwrap();
+        let owned = write_cached_png(&cache, &source);
+        let unrelated = cache
+            .join("thumbnails/normal")
+            .join("other-application.png");
+        fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        fs::write(&unrelated, TEST_PNG).unwrap();
+
+        enforce_thumbnail_cache_limit_to(&cache, 1);
+        assert!(!owned.exists());
+        assert!(unrelated.exists());
+
+        let owned = write_cached_png(&cache, &source);
+        clear_filem_thumbnail_cache(&cache).unwrap();
+        assert!(!owned.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]
