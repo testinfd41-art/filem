@@ -61,6 +61,15 @@ Item {
         return remMins > 0 ? (hours + "h " + remMins + "m left") : (hours + "h left")
     }
 
+    function formatJobTimes(job) {
+        var times = []
+        if (job.startedAtMs > 0)
+            times.push("Started at " + new Date(job.startedAtMs).toLocaleTimeString())
+        if (job.finishedAtMs > 0)
+            times.push("Finished at " + new Date(job.finishedAtMs).toLocaleTimeString())
+        return times.join(" · ")
+    }
+
     function scrollJobsByWheel(delta) {
         if (!jobsWheelAnimation.running)
             jobsWheelTargetY = jobsFlickable.contentY
@@ -355,16 +364,46 @@ Item {
                 }
 
                 Text {
+                    readonly property string routeText:
+                        (card.job.sources || "")
+                        + (card.job.destination ? " → " + card.job.destination : "")
                     Layout.fillWidth: true
-                    visible: card.isActive || card.job.status === "queued"
-                    text: card.isActive && card.job.currentItem !== ""
-                          ? card.job.currentItem
-                          : (card.job.sources
-                             + (card.job.destination !== "" ? " → " + card.job.destination : ""))
+                    objectName: "transferRoute_" + String(card.job.id)
+                    visible: Boolean(card.job.sources || card.job.destination)
+                    text: routeText
                     color: root.theme ? root.theme.muted : "#9299a8"
                     font.family: root.theme ? root.theme.mono_font : "monospace"
                     font.pixelSize: 10 * (root.theme ? root.theme.font_scale : 1)
                     elide: Text.ElideMiddle
+                }
+
+                Text {
+                    objectName: "transferCurrentItem_" + String(card.job.id)
+                    visible: card.isActive && Boolean(card.job.currentItem)
+                    text: "Current: " + (card.job.currentItem || "")
+                    color: root.theme ? root.theme.muted : "#9299a8"
+                    font.family: root.theme ? root.theme.mono_font : "monospace"
+                    font.pixelSize: 10 * (root.theme ? root.theme.font_scale : 1)
+                    elide: Text.ElideMiddle
+                }
+
+                Text {
+                    objectName: "transferSize_" + String(card.job.id)
+                    visible: card.job.sizeKnown === true
+                    text: card.job.hasProgressBytes === true
+                          ? "Data: " + card.job.completedSize + " / " + card.job.totalSize
+                          : "Size: " + card.job.totalSize
+                    color: root.theme ? root.theme.muted : "#9299a8"
+                    font.pixelSize: 10 * (root.theme ? root.theme.font_scale : 1)
+                }
+
+                Text {
+                    readonly property string timeText: root.formatJobTimes(card.job)
+                    objectName: "transferTimes_" + String(card.job.id)
+                    visible: timeText !== ""
+                    text: timeText
+                    color: root.theme ? root.theme.muted : "#9299a8"
+                    font.pixelSize: 10 * (root.theme ? root.theme.font_scale : 1)
                 }
 
                 RowLayout {
@@ -454,6 +493,13 @@ Item {
 
                         RowLayout {
                             Layout.fillWidth: true
+                            Text {
+                                objectName: "transferDetailSize"
+                                text: (modelData.isDirectory ? "Folder" : "File")
+                                      + " · " + (modelData.size || "0 B")
+                                color: root.theme ? root.theme.muted : "#9299a8"
+                                font.pixelSize: 10 * (root.theme ? root.theme.font_scale : 1)
+                            }
                             Text {
                                 text: modelData.status
                                 color: modelData.status === "failed"

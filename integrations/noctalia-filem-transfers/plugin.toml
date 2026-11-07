@@ -1,0 +1,20 @@
+id = "testinfd41-art/filem-transfers"
+name = "Filem Transfers"
+version = "1.0.0"
+plugin_api = 24
+author = "testinfd41-art"
+license = "MIT"
+icon = "copy"
+description = "Shows live Filem transfer progress on a Noctalia bar."
+
+[[widget]]
+id = "transfers"
+entry = "widget.luau"
+
+[[panel]]
+id = "manager"
+entry = "panel.luau"
+width = 480
+height = 500
+placement = "floating"
+position = "center"

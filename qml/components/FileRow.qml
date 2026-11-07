@@ -134,7 +134,7 @@ Rectangle {
 
     function open() {
         if (backend)
-            backend.open_index(index)
+            backend.open_path(entryPath)
     }
 
     function toggleTree() {
@@ -429,7 +429,6 @@ Rectangle {
             var moved = Math.abs(mouse.x - dragOrigin.x) + Math.abs(mouse.y - dragOrigin.y)
             if (moved <= Qt.styleHints.startDragDistance)
                 return
-            console.warn("ROW threshold", root.entryPath, moved, "marquee", isMarqueeGesture)
 
             suppressClick = true
 

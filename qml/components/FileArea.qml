@@ -1955,7 +1955,7 @@ Item {
                         }
                         onDoubleClicked: {
                             if (root.backend)
-                                root.backend.open_index(index)
+                                root.backend.open_path(model.path)
                         }
                         onWheel: function(wheel) {
                             wheel.accepted = false

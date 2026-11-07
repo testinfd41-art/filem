@@ -631,6 +631,30 @@ fn transfer_job_variant(job: &transfer::JobSnapshot) -> QVariantMap {
         QVariant::from(job.eta_seconds.map_or(-1, |value| value as i32)),
     );
     map.insert(
+        QString::from("sizeKnown"),
+        QVariant::from(job.inventory_ready),
+    );
+    map.insert(
+        QString::from("totalSize"),
+        QVariant::from(QString::from(format_size(job.total_bytes))),
+    );
+    map.insert(
+        QString::from("completedSize"),
+        QVariant::from(QString::from(format_size(job.bytes_completed))),
+    );
+    map.insert(
+        QString::from("hasProgressBytes"),
+        QVariant::from(job.bytes_completed > 0),
+    );
+    map.insert(
+        QString::from("startedAtMs"),
+        QVariant::from(job.started_at_ms.unwrap_or(0) as f64),
+    );
+    map.insert(
+        QString::from("finishedAtMs"),
+        QVariant::from(job.finished_at_ms.unwrap_or(0) as f64),
+    );
+    map.insert(
         QString::from("summary"),
         QVariant::from(QString::from(job.summary.clone())),
     );
@@ -1192,6 +1216,7 @@ pub struct Backend {
     redo: qt_method!(fn(&mut self)),
     cancel_operation: qt_method!(fn(&mut self)),
     refresh_transfer_jobs: qt_method!(fn(&mut self)),
+    flush_pending_watch_events: qt_method!(fn(&mut self)),
     transfer_job_items: qt_method!(fn(&self, id: QString) -> QVariantList),
     cancel_transfer_job: qt_method!(fn(&mut self, id: QString)),
     cancel_pending_transfers: qt_method!(fn(&mut self)),
@@ -1254,6 +1279,7 @@ pub struct Backend {
     watch_path: Option<PathBuf>,
     watch_tab: Option<u64>,
     watch_paths: HashSet<PathBuf>,
+    pending_watch_events: HashSet<(u64, PathBuf)>,
     seen_refreshes: HashSet<PathBuf>,
     properties_generation: u64,
     properties_cancel: Option<Arc<AtomicBool>>,
@@ -1455,6 +1481,7 @@ impl Default for Backend {
             redo: Default::default(),
             cancel_operation: Default::default(),
             refresh_transfer_jobs: Default::default(),
+            flush_pending_watch_events: Default::default(),
             transfer_job_items: Default::default(),
             cancel_transfer_job: Default::default(),
             cancel_pending_transfers: Default::default(),
@@ -1513,6 +1540,7 @@ impl Default for Backend {
             watch_path: None,
             watch_tab: None,
             watch_paths: HashSet::new(),
+            pending_watch_events: HashSet::new(),
             seen_refreshes: HashSet::new(),
             properties_generation: 0,
             properties_cancel: None,
@@ -3290,8 +3318,8 @@ impl Backend {
                 (Ok(entries), missing)
             } else {
                 (
-                    read_directory(&target, spec, show_hidden, &icons),
-                    Vec::new(),
+                        read_directory(&target, spec, show_hidden, &icons),
+                        Vec::new(),
                 )
             };
             if target == trash_dir() {
@@ -5521,6 +5549,7 @@ impl Backend {
 
     fn refresh_transfer_jobs(&mut self) {
         let jobs = transfer::snapshots();
+        crate::transfer_export::publish(&jobs);
         let mut list = QVariantList::default();
         for job in &jobs {
             list.push(QVariant::from(transfer_job_variant(job)));
@@ -5555,6 +5584,10 @@ impl Backend {
             map.insert(
                 QString::from("isDirectory"),
                 QVariant::from(item.is_directory),
+            );
+            map.insert(
+                QString::from("size"),
+                QVariant::from(QString::from(format_size(item.size_bytes))),
             );
             map.insert(
                 QString::from("status"),
@@ -7235,6 +7268,10 @@ impl Backend {
 
     fn watch_fired(&mut self, tab_id: u64, changed_directory: PathBuf) {
         if self.op_active || transfer::is_busy() || self.loading {
+            // Transfers refresh only their initiating window, so keep watcher
+            // events from other windows until the process-wide queue is idle.
+            self.pending_watch_events
+                .insert((tab_id, changed_directory));
             return;
         }
         let Some(index) = self.tab_index(tab_id) else {
@@ -7267,6 +7304,16 @@ impl Backend {
         self.ensure_watch();
         if expanded {
             self.start_tree_load(index, changed_directory);
+        }
+    }
+
+    fn flush_pending_watch_events(&mut self) {
+        if self.op_active || transfer::is_busy() || self.loading {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_watch_events);
+        for (tab_id, changed_directory) in pending {
+            self.watch_fired(tab_id, changed_directory);
         }
     }
 
@@ -7518,6 +7565,20 @@ mod tests {
 
         tab.loading = false;
         assert!(!tab.shows_loading_indicator());
+    }
+
+    #[test]
+    fn watch_events_are_coalesced_while_an_operation_is_busy() {
+        let mut backend = test_backend_with_tabs();
+        backend.op_active = true;
+        let changed_directory = PathBuf::from("/tmp/search-one");
+
+        backend.watch_fired(1, changed_directory.clone());
+        backend.watch_fired(1, changed_directory.clone());
+        assert_eq!(backend.pending_watch_events.len(), 1);
+
+        backend.flush_pending_watch_events();
+        assert_eq!(backend.pending_watch_events.len(), 1);
     }
 
     #[test]

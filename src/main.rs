@@ -15,6 +15,7 @@ mod sysclip;
 mod tags;
 mod theme;
 mod transfer;
+mod transfer_export;
 mod volumes;
 
 use std::path::PathBuf;
@@ -161,5 +162,6 @@ fn main() {
             .unwrap_or_else(|_| QString::from(qml.to_string_lossy().into_owned())),
     );
     engine.exec();
+    transfer_export::cleanup();
     drop(instance_guard);
 }

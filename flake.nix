@@ -102,8 +102,8 @@
           mkdir -p $out/share/filem
           cp -r qml $out/share/filem/qml
           install -Dm644 packaging/filem.desktop $out/share/applications/filem.desktop
-          install -Dm644 packaging/filem.svg \
-            $out/share/icons/hicolor/scalable/apps/filem.svg
+          install -Dm644 packaging/filem.png \
+            $out/share/icons/hicolor/512x512/apps/filem.png
         '';
 
         meta = {

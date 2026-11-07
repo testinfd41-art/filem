@@ -235,6 +235,133 @@ TestCase {
         })
     }
 
+    function test_routes_show_source_and_destination_for_active_and_completed_jobs() {
+        fakeBackend.transfer_jobs = [
+            {
+                id: "31",
+                operation: "Copy",
+                status: "running",
+                currentItem: "/source/file.txt",
+                sources: "/source/file.txt",
+                destination: "/destination",
+                progress: 0.5,
+                completedFiles: 0,
+                totalFiles: 1,
+                completedFolders: 0,
+                totalFolders: 0,
+                bytesPerSecond: 0,
+                etaSeconds: -1,
+                summary: "",
+                error: "",
+                omittedItemDetails: 0
+            },
+            {
+                id: "32",
+                operation: "Copy",
+                status: "completed",
+                currentItem: "",
+                sources: "/source/finished.txt",
+                destination: "/destination",
+                progress: 1,
+                completedFiles: 1,
+                totalFiles: 1,
+                completedFolders: 0,
+                totalFolders: 0,
+                bytesPerSecond: 0,
+                etaSeconds: -1,
+                summary: "Copied one file",
+                error: "",
+                omittedItemDetails: 0
+            }
+        ]
+        fakeBackend.transfer_jobs_changed()
+        manager.open = true
+        wait(0)
+
+        var activeRoute = findChild(manager, "transferRoute_31")
+        var currentItem = findChild(manager, "transferCurrentItem_31")
+        var completedRoute = findChild(manager, "transferRoute_32")
+        verify(activeRoute !== null)
+        verify(currentItem !== null)
+        verify(completedRoute !== null)
+        compare(activeRoute.text, "/source/file.txt → /destination")
+        compare(currentItem.text, "Current: /source/file.txt")
+        compare(completedRoute.text, "/source/finished.txt → /destination")
+    }
+
+    function test_job_and_item_sizes_are_shown() {
+        fakeBackend.transfer_jobs = [{
+            id: "41",
+            operation: "Copy",
+            status: "running",
+            currentItem: "/source/folder",
+            sources: "/source/folder",
+            destination: "/destination",
+            progress: 0.5,
+            completedFiles: 1,
+            totalFiles: 2,
+            completedFolders: 0,
+            totalFolders: 1,
+            bytesPerSecond: 0,
+            etaSeconds: -1,
+            sizeKnown: true,
+            hasProgressBytes: true,
+            completedSize: "512 KiB",
+            totalSize: "1.0 MiB",
+            summary: "",
+            error: "",
+            omittedItemDetails: 0
+        }]
+        fakeBackend.detailItems = [{
+            path: "/source/folder",
+            name: "folder",
+            isDirectory: true,
+            size: "1.0 MiB",
+            status: "running",
+            error: ""
+        }]
+        fakeBackend.transfer_jobs_changed()
+        manager.open = true
+        wait(0)
+
+        var size = findChild(manager, "transferSize_41")
+        verify(size !== null)
+        compare(size.text, "Data: 512 KiB / 1.0 MiB")
+        manager.toggleDetails(fakeBackend.transfer_jobs[0])
+        wait(0)
+        var itemSize = findChild(manager, "transferDetailSize")
+        verify(itemSize !== null)
+        compare(itemSize.text, "Folder · 1.0 MiB")
+    }
+
+    function test_job_start_and_finish_times_are_shown() {
+        var startedAt = Date.UTC(2026, 10, 7, 17, 40, 0)
+        var finishedAt = Date.UTC(2026, 10, 7, 17, 42, 0)
+        fakeBackend.transfer_jobs = [{
+            id: "42",
+            operation: "Copy",
+            status: "completed",
+            sources: "/source/file.txt",
+            destination: "/destination",
+            startedAtMs: startedAt,
+            finishedAtMs: finishedAt,
+            summary: "Copied one file",
+            error: "",
+            omittedItemDetails: 0
+        }]
+        fakeBackend.transfer_jobs_changed()
+        manager.open = true
+        wait(0)
+
+        var times = findChild(manager, "transferTimes_42")
+        verify(times !== null)
+        verify(times.visible)
+        verify(times.text.indexOf("Started at "
+                                  + new Date(startedAt).toLocaleTimeString()) >= 0)
+        verify(times.text.indexOf("Finished at "
+                                  + new Date(finishedAt).toLocaleTimeString()) >= 0)
+    }
+
     function test_job_list_wheel_scroll_is_smoothed() {
         var jobs = []
         for (var index = 0; index < 20; index++) {
@@ -311,6 +438,32 @@ TestCase {
         var metrics = findChild(panel, "compactTransferMetrics")
         verify(metrics.text.indexOf("40%") >= 0)
         verify(metrics.text.indexOf("2.0 MB/s") >= 0)
+    }
+
+    function test_compact_progress_shows_transferred_size() {
+        fakeBackend.transfer_jobs = [{
+            id: "44",
+            operation: "Copy",
+            status: "running",
+            progress: 0.5,
+            completedFiles: 1,
+            totalFiles: 2,
+            completedFolders: 0,
+            totalFolders: 0,
+            sizeKnown: true,
+            hasProgressBytes: true,
+            completedSize: "512 KiB",
+            totalSize: "1.0 MiB",
+            bytesPerSecond: 0,
+            etaSeconds: -1,
+            summary: "",
+            error: ""
+        }]
+        fakeBackend.transfer_jobs_changed()
+
+        var metrics = findChild(panel, "compactTransferMetrics")
+        verify(metrics.text.indexOf("50%") >= 0)
+        verify(metrics.text.indexOf("512 KiB / 1.0 MiB") >= 0)
     }
 
     function test_compact_progress_shows_eta_when_running() {

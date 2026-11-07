@@ -10,6 +10,7 @@ Item {
     property int dragStartCount: 0
     property bool nativeDragStarted: false
     property bool columnMode: false
+    property string openedPath: ""
 
     QtObject {
         id: fakeBackend
@@ -23,6 +24,9 @@ Item {
         property bool recent_view: false
         property bool tag_collection_view: false
         property bool single_click_open: false
+
+        function open_path(path) { root.openedPath = path }
+        function open_index(index) { root.openedPath = "index:" + index }
     }
 
     Item {
@@ -161,6 +165,7 @@ Item {
         function init() {
             root.dragStartCount = 0
             root.nativeDragStarted = false
+            root.openedPath = ""
             fakeArea.dragActive = false
             fakeArea.dragPaths = []
             fakeArea.selected = ({})
@@ -199,6 +204,15 @@ Item {
             compare(root.dragStartCount, 1)
             compare(fakeArea.dragPaths, ["/source/item", "/source/other"])
             mouseRelease(mouseArea, 350, 18, Qt.LeftButton)
+        }
+
+        function test_doubleClickOpensTheDelegatesPath() {
+            var row = findChild(root, "dragTestRow")
+            verify(row !== null)
+            var mouseArea = findChild(row, "fileRowMouseArea")
+            verify(mouseArea !== null)
+            mouseDoubleClick(mouseArea, 320, 18, Qt.LeftButton)
+            compare(root.openedPath, "/source/item")
         }
     }
 }

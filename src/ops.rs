@@ -131,35 +131,49 @@ pub struct FileProgress {
 /// for a bounded prefix; progress events account for the remainder.
 pub fn transfer_inventory(sources: &[PathBuf]) -> TransferInventory {
     const MAX_DETAILS: usize = 2_000;
-    fn visit(path: &Path, inventory: &mut TransferInventory) {
+    fn visit(path: &Path, inventory: &mut TransferInventory) -> u64 {
         let metadata = fs::symlink_metadata(path).ok();
         let file_type = metadata.as_ref().map(|meta| meta.file_type());
         let is_directory = file_type.is_some_and(|kind| kind.is_dir());
-        let size_bytes = if file_type.is_some_and(|kind| kind.is_file()) {
-            metadata.as_ref().map_or(0, |meta| meta.len())
-        } else {
-            0
-        };
         if is_directory {
             inventory.total_folders += 1;
+            let detail_index = if inventory.items.len() < MAX_DETAILS {
+                let index = inventory.items.len();
+                inventory.items.push(InventoryItem {
+                    path: path.to_path_buf(),
+                    is_directory: true,
+                    size_bytes: 0,
+                });
+                Some(index)
+            } else {
+                None
+            };
+            let mut size_bytes = 0u64;
+            if let Ok(read) = fs::read_dir(path) {
+                for entry in read.flatten() {
+                    size_bytes = size_bytes.saturating_add(visit(&entry.path(), inventory));
+                }
+            }
+            if let Some(index) = detail_index {
+                inventory.items[index].size_bytes = size_bytes;
+            }
+            size_bytes
         } else {
+            let size_bytes = if file_type.is_some_and(|kind| kind.is_file()) {
+                metadata.as_ref().map_or(0, |meta| meta.len())
+            } else {
+                0
+            };
             inventory.total_files += 1;
             inventory.total_bytes = inventory.total_bytes.saturating_add(size_bytes);
-        }
-        if inventory.items.len() < MAX_DETAILS {
-            inventory.items.push(InventoryItem {
-                path: path.to_path_buf(),
-                is_directory,
-                size_bytes,
-            });
-        }
-        if !is_directory {
-            return;
-        }
-        if let Ok(read) = fs::read_dir(path) {
-            for entry in read.flatten() {
-                visit(&entry.path(), inventory);
+            if inventory.items.len() < MAX_DETAILS {
+                inventory.items.push(InventoryItem {
+                    path: path.to_path_buf(),
+                    is_directory: false,
+                    size_bytes,
+                });
             }
+            size_bytes
         }
     }
 
@@ -3878,6 +3892,9 @@ mod tests {
         assert_eq!(inventory.total_files, 257);
         assert_eq!(inventory.total_bytes, 2 * 1024 * 1024 + 256);
         assert_eq!(inventory.items.len(), 259);
+        assert_eq!(inventory.items[0].path, source);
+        assert_eq!(inventory.items[0].size_bytes, 2 * 1024 * 1024 + 256);
+        assert_eq!(inventory.items[1].size_bytes, 256);
     }
 
     #[test]

@@ -34,10 +34,18 @@ Rectangle {
                                          && (activeJob.status === "completed"
                                              || activeJob.status === "failed"
                                              || activeJob.status === "cancelled")
+    readonly property string sizeMetrics: {
+        if (!activeJob || activeJob.sizeKnown !== true)
+            return ""
+        if (activeJob.hasProgressBytes === true)
+            return activeJob.completedSize + " / " + activeJob.totalSize
+        return activeJob.totalSize + " total"
+    }
     readonly property string transferMetrics: activeJob
                                                ? activeJob.completedFiles + " / "
                                                  + activeJob.totalFiles + " files · "
                                                  + Math.round(activeJob.progress * 100) + "%"
+                                                 + (sizeMetrics !== "" ? " · " + sizeMetrics : "")
                                                  + (activeJob.bytesPerSecond > 0
                                                     ? " · " + formatSpeed(activeJob.bytesPerSecond)
                                                     : "")

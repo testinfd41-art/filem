@@ -660,8 +660,9 @@ Window {
     Timer {
         interval: 600
         repeat: true
-        running: root.visible
+        running: true
         onTriggered: {
+            backend.flush_pending_watch_events()
             backend.refresh_transfer_jobs()
             backend.refresh_clipboard_state()
         }

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_HISTORY: usize = 40;
 const MAX_JOBS: usize = 120;
@@ -93,6 +93,7 @@ impl ItemStatus {
 pub struct ItemSnapshot {
     pub path: PathBuf,
     pub is_directory: bool,
+    pub size_bytes: u64,
     pub status: ItemStatus,
     pub error: String,
 }
@@ -117,6 +118,9 @@ pub struct JobSnapshot {
     pub eta_seconds: Option<u64>,
     pub bytes_completed: u64,
     pub total_bytes: u64,
+    pub inventory_ready: bool,
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
     pub summary: String,
     pub error: String,
     pub items: Vec<ItemSnapshot>,
@@ -250,6 +254,7 @@ impl TransferManager {
                 .map(|path| ItemSnapshot {
                     path: path.clone(),
                     is_directory: false,
+                    size_bytes: 0,
                     status: ItemStatus::Waiting,
                     error: String::new(),
                 })
@@ -274,6 +279,9 @@ impl TransferManager {
                     eta_seconds: None,
                     bytes_completed: 0,
                     total_bytes: 0,
+                    inventory_ready: false,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                     summary: String::new(),
                     error: String::new(),
                     items: source_items,
@@ -326,6 +334,7 @@ impl TransferManager {
                 entry.cancel.store(true, Ordering::Relaxed);
                 entry.worker = None;
                 entry.snapshot.status = JobStatus::Cancelled;
+                entry.snapshot.finished_at_ms = Some(epoch_millis());
                 entry.snapshot.summary = "Cancelled before starting".into();
                 for item in &mut entry.snapshot.items {
                     item.status = ItemStatus::Cancelled;
@@ -350,6 +359,7 @@ impl TransferManager {
                 entry.cancel.store(true, Ordering::Relaxed);
                 entry.worker = None;
                 entry.snapshot.status = JobStatus::Cancelled;
+                entry.snapshot.finished_at_ms = Some(epoch_millis());
                 entry.snapshot.summary = "Cancelled before starting".into();
                 for item in &mut entry.snapshot.items {
                     item.status = ItemStatus::Cancelled;
@@ -380,6 +390,7 @@ impl TransferManager {
                         }) {
                             entry.snapshot.status = JobStatus::Running;
                             entry.started_at = Some(Instant::now());
+                            entry.snapshot.started_at_ms = Some(epoch_millis());
                             break id;
                         }
                     }
@@ -435,6 +446,7 @@ impl TransferManager {
             return;
         };
         entry.snapshot.status = result.status;
+        entry.snapshot.finished_at_ms = Some(epoch_millis());
         entry.snapshot.summary = result.summary;
         entry.snapshot.error = result.error;
         entry.snapshot.current_item = PathBuf::new();
@@ -473,6 +485,14 @@ impl TransferManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn prune_history(state: &mut QueueState) {
@@ -657,6 +677,7 @@ impl JobContext {
             entry.snapshot.total_files = total_files;
             entry.snapshot.total_folders = total_folders;
             entry.snapshot.total_bytes = total_bytes;
+            entry.snapshot.inventory_ready = true;
             entry.untracked_completed_files = 0;
             entry.untracked_completed_folders = 0;
             entry.untracked_skipped = 0;
@@ -667,6 +688,7 @@ impl JobContext {
                 .map(|item| ItemSnapshot {
                     path: item.path.clone(),
                     is_directory: item.is_directory,
+                    size_bytes: item.size_bytes,
                     status: ItemStatus::Waiting,
                     error: String::new(),
                 })
@@ -1010,7 +1032,7 @@ mod tests {
                     ItemInfo {
                         path: PathBuf::from("/source"),
                         is_directory: true,
-                        size_bytes: 0,
+                        size_bytes: 30,
                     },
                     ItemInfo {
                         path: PathBuf::from("/source/a"),
@@ -1044,6 +1066,13 @@ mod tests {
         let job = wait_for(&manager, id, JobStatus::Failed);
         assert_eq!(job.total_files, 2);
         assert_eq!(job.total_folders, 1);
+        assert_eq!(job.total_bytes, 30);
+        assert!(job.inventory_ready);
+        assert!(job.started_at_ms.is_some());
+        assert!(job.finished_at_ms.is_some());
+        assert_eq!(job.items[0].size_bytes, 30);
+        assert_eq!(job.items[1].size_bytes, 10);
+        assert_eq!(job.items[2].size_bytes, 20);
         assert_eq!(job.completed_files, 1);
         assert_eq!(job.failed_items, 1);
         assert!(job.items.iter().any(|item| {
