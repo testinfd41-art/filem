@@ -1,0 +1,30 @@
+{
+  "mode": "dark",
+  "background": "#0f1115",
+  "surface": "#151820",
+  "surfaceAlt": "#1c202a",
+  "foreground": "#e7e9ee",
+  "muted": "#9299a8",
+  "accent": "#8ab4f8",
+  "border": "#292e3a",
+  "selection": "#24364f",
+  "selectionText": "#f2f5fb",
+  "hover": "#202531",
+  "focus": "#8ab4f8",
+  "danger": "#f28b82",
+  "tags": [
+    "#f28b82",
+    "#f5a97f",
+    "#e5c07b",
+    "#8fbf7f",
+    "#8ab4f8",
+    "#c39bea",
+    "#9aa0ac"
+  ],
+  "radius": 10,
+  "spacing": 8,
+  "rowHeight": 34,
+  "opacity": 1.0,
+  "fontFamily": "Ubuntu Sans",
+  "monoFont": "JetBrainsMono Nerd Font"
+}

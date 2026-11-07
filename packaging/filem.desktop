@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Filem
+GenericName=File Manager
+Comment=A quiet, keyboard-first file manager
+Exec=filem %f
+Icon=filem
+Terminal=false
+Categories=System;FileManager;
+MimeType=inode/directory;
+Keywords=files;folders;browse;manager;
+StartupNotify=true
+StartupWMClass=filem
