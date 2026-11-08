@@ -114,6 +114,16 @@ nix build .#filem
 ./result/bin/filem
 ```
 
+For a binary to carry to another NixOS installation, build it without Nix-store
+RPATHs:
+
+```bash
+nix develop --command bash scripts/build-portable.sh
+```
+
+The resulting `target/release/filem` still needs the matching Qt runtime and
+QML files at launch; the NixOS system configuration should provide those.
+
 ## Keyboard
 
 | Keys | Action |

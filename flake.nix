@@ -13,8 +13,8 @@
       # qmetaobject discovers Qt through one include directory and one library
       # directory. Nix gives each Qt module its own store path, so merge the
       # modules we use into a single prefix.
-      qt = pkgs.buildEnv {
-        name = "filem-qt";
+      qtBuild = pkgs.buildEnv {
+        name = "filem-qt-build";
         paths = with pkgs.qt6; [
           qtbase
           qtbase.dev
@@ -30,14 +30,28 @@
         ignoreCollisions = true;
       };
 
+      qtRuntime = pkgs.buildEnv {
+        name = "filem-qt-runtime";
+        paths = with pkgs.qt6; [
+          qtbase
+          qtdeclarative
+          qtmultimedia
+          qtwayland
+          qtsvg
+        ] ++ [
+          pkgs.libglvnd
+        ];
+        ignoreCollisions = true;
+      };
+
       commonEnv = {
-        QMAKE = "${qt}/bin/qmake";
-        QT_INCLUDE_PATH = "${qt}/include";
-        QT_LIBRARY_PATH = "${qt}/lib";
-        QML2_IMPORT_PATH = "${qt}/lib/qt-6/qml";
-        QML_IMPORT_PATH = "${qt}/lib/qt-6/qml";
-        QT_PLUGIN_PATH = "${qt}/lib/qt-6/plugins";
-        LD_LIBRARY_PATH = "${qt}/lib:${pkgs.glib}/lib";
+        QMAKE = "${qtBuild}/bin/qmake";
+        QT_INCLUDE_PATH = "${qtBuild}/include";
+        QT_LIBRARY_PATH = "${qtRuntime}/lib";
+        QML2_IMPORT_PATH = "${qtRuntime}/lib/qt-6/qml";
+        QML_IMPORT_PATH = "${qtRuntime}/lib/qt-6/qml";
+        QT_PLUGIN_PATH = "${qtRuntime}/lib/qt-6/plugins";
+        LD_LIBRARY_PATH = "${qtRuntime}/lib:${pkgs.glib}/lib";
       };
 
       filem = pkgs.rustPlatform.buildRustPackage {
@@ -56,12 +70,23 @@
         nativeBuildInputs = [
           pkgs.pkg-config
           pkgs.qt6.wrapQtAppsHook
+        ];
+        nativeCheckInputs = [
           pkgs.ffmpeg
+          pkgs.imagemagick
+          pkgs.poppler-utils
           pkgs.p7zip
-          pkgs.glib.bin
+          pkgs.file
           pkgs.exiftool
+          pkgs.glib.bin
+          pkgs.gvfs
+          pkgs.udisks
+          pkgs.util-linux
+          pkgs.systemd
+          pkgs.bzip2
+          pkgs.xz
+          pkgs.zstd
           pkgs.shared-mime-info
-
         ];
         buildInputs = [
           pkgs.qt6.qtbase
@@ -69,32 +94,24 @@
           pkgs.qt6.qtmultimedia
           pkgs.qt6.qtwayland
           pkgs.qt6.qtsvg
-          qt
+          qtRuntime
           pkgs.glib
           pkgs.glib.dev
-          pkgs.shared-mime-info
-          pkgs.ffmpeg
-          pkgs.poppler-utils
-          pkgs.p7zip
-          pkgs.file
-          pkgs.exiftool
         ];
 
         env = commonEnv;
 
         qtWrapperArgs = [
-          "--prefix QT_PLUGIN_PATH : ${qt}/lib/qt-6/plugins"
-          "--prefix QML2_IMPORT_PATH : ${qt}/lib/qt-6/qml"
-          "--prefix QML_IMPORT_PATH : ${qt}/lib/qt-6/qml"
-          "--prefix LD_LIBRARY_PATH : ${qt}/lib"
+          "--prefix QT_PLUGIN_PATH : ${qtRuntime}/lib/qt-6/plugins"
+          "--prefix QML2_IMPORT_PATH : ${qtRuntime}/lib/qt-6/qml"
+          "--prefix QML_IMPORT_PATH : ${qtRuntime}/lib/qt-6/qml"
+          "--prefix LD_LIBRARY_PATH : ${qtRuntime}/lib"
           "--prefix LD_LIBRARY_PATH : ${pkgs.glib}/lib"
-          "--prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ffmpeg pkgs.imagemagick pkgs.libnotify pkgs.poppler-utils pkgs.p7zip pkgs.file pkgs.exiftool pkgs.glib.bin pkgs.gvfs pkgs.udisks pkgs.util-linux pkgs.systemd pkgs.bzip2 pkgs.xz pkgs.zstd ]}"
-          "--prefix GIO_EXTRA_MODULES : ${pkgs.gvfs}/lib/gio/modules"
-          "--prefix XDG_DATA_DIRS : ${pkgs.gvfs}/share"
-          "--prefix XDG_DATA_DIRS : ${pkgs.shared-mime-info}/share"
         ];
 
         preCheck = ''
+          export XDG_CACHE_HOME="$TMPDIR/filem-cache"
+          mkdir -p "$XDG_CACHE_HOME"
           export XDG_DATA_DIRS="${pkgs.shared-mime-info}/share:${pkgs.gvfs}/share"
         '';
 
@@ -118,6 +135,7 @@
       packages.${system} = {
         default = filem;
         filem = filem;
+        qt-runtime = qtRuntime;
       };
 
       devShells.${system}.default = pkgs.mkShell {
@@ -126,8 +144,8 @@
           pkgs.rustc
           pkgs.rustfmt
           pkgs.clippy
+          pkgs.patchelf
           pkgs.pkg-config
-          pkgs.qt6.qtmultimedia
           pkgs.ffmpeg
           pkgs.imagemagick
           pkgs.libnotify
@@ -144,7 +162,6 @@
           pkgs.bzip2
           pkgs.xz
           pkgs.zstd
-          qt
         ];
 
         inherit (commonEnv) QMAKE QT_INCLUDE_PATH QT_LIBRARY_PATH

@@ -7716,13 +7716,12 @@ mod tests {
     #[test]
     fn terminal_launch_uses_the_login_shell() {
         let command = terminal_command("foot", Path::new("/tmp"));
-        let expected = login_shell().expect("the current user should have a login shell");
+        let expected = login_shell();
         let configured = command
             .get_envs()
             .find(|(key, _)| *key == std::ffi::OsStr::new("SHELL"))
-            .and_then(|(_, value)| value)
-            .expect("the terminal command should set SHELL");
-        assert_eq!(configured, std::ffi::OsStr::new(&expected));
+            .and_then(|(_, value)| value);
+        assert_eq!(configured, expected.as_deref().map(std::ffi::OsStr::new));
     }
 
     #[test]

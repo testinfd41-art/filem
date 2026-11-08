@@ -3894,7 +3894,13 @@ mod tests {
         assert_eq!(inventory.items.len(), 259);
         assert_eq!(inventory.items[0].path, source);
         assert_eq!(inventory.items[0].size_bytes, 2 * 1024 * 1024 + 256);
-        assert_eq!(inventory.items[1].size_bytes, 256);
+        let nested = source.join("nested");
+        let nested_item = inventory
+            .items
+            .iter()
+            .find(|item| item.path == nested)
+            .expect("the nested directory should be in the inventory");
+        assert_eq!(nested_item.size_bytes, 256);
     }
 
     #[test]
