@@ -123,7 +123,7 @@ fn is_text_extension(extension: &str) -> bool {
     )
 }
 
-fn is_image_extension(extension: &str) -> bool {
+pub(crate) fn is_image_extension(extension: &str) -> bool {
     matches!(
         extension,
         "png"

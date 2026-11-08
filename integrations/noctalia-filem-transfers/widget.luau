@@ -3,9 +3,13 @@ local status = require("./lib/status.luau")
 local function render()
   local jobs = status.activeJobs(status.readJobs())
   local job = jobs[1]
+  barWidget.setVisible(true)
   if job == nil then
-    barWidget.setTooltip(nil)
-    barWidget.setVisible(false)
+    barWidget.render(ui.row({ gap = 5, align = "center" }, {
+      ui.glyph({ name = "sync_alt", size = 14, color = "primary" }),
+      ui.label({ text = "Filem", fontSize = 12, fontWeight = "medium" }),
+    }))
+    barWidget.setTooltip({ { key = "Status", value = "No active transfers" } })
     return
   end
 
@@ -17,9 +21,8 @@ local function render()
     label = #jobs .. " transfers"
   end
 
-  barWidget.setVisible(true)
   barWidget.render(ui.row({ gap = 5, align = "center" }, {
-    ui.glyph({ name = "copy", size = 14, color = "primary" }),
+    ui.glyph({ name = "sync_alt", size = 14, color = "primary" }),
     ui.label({ text = label, fontSize = 12, fontWeight = "medium" }),
   }))
 

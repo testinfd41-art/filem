@@ -134,6 +134,7 @@ Item {
     signal requestExtractTo(string path)
     signal requestTag(var paths)
     signal requestCompress(var paths)
+    signal requestConvert(var paths)
     signal requestSearch(string query)
 
     Item {
@@ -920,6 +921,9 @@ Item {
         var entries = []
         var defaultApp = !isDir && !many && !inTrash
                          ? backend.default_app_name(path) : ""
+        var canConvert = selected.length > 0 && !inTrash
+        for (var selectedIndex = 0; selectedIndex < selected.length && canConvert; selectedIndex++)
+            canConvert = backend.is_image_file(selected[selectedIndex])
 
         entries.push({
             label: isDir ? "Open Folder"
@@ -1006,6 +1010,12 @@ Item {
                     label: "Compress\u2026",
                     enabled: selected.length > 0,
                     action: function() { root.requestCompress(selected.slice()) }
+                })
+            }
+            if (canConvert) {
+                entries.push({
+                    label: "Convert Images\u2026",
+                    action: function() { root.requestConvert(selected.slice()) }
                 })
             }
             if (!many && backend.is_archive(path)) {
@@ -1571,6 +1581,9 @@ Item {
                                                   || gridDropArea.containsDrag)
                     property bool gridHovered: gridMouse.containsMouse && !gridSelected
                     property string entryPath: model.path
+                    readonly property bool renaming: root.backend
+                                                     ? root.backend.renaming_path === entryPath
+                                                     : false
                     readonly property var entryTags: model.tags || []
                     property bool imageThumbnail: [
                         "png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "tif", "tiff", "avif", "ico",
@@ -1718,6 +1731,7 @@ Item {
                             anchors.horizontalCenter: parent.horizontalCenter
                             width: Math.min(parent.width, root.gridIconSize + 28 * root.zoom)
                             height: root.gridLabelHeight
+                            visible: !gridDelegate.renaming
                             text: root.backend && root.backend.recent_view
                                   ? (model.name || "") + "\n"
                                     + (model.kind || "") + "\n"
@@ -1740,6 +1754,50 @@ Item {
                             horizontalAlignment: Text.AlignHCenter
                             clip: true
                             Accessible.name: model.name || ""
+                        }
+
+                        TextInput {
+                            id: gridRenameInput
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            width: Math.min(parent.width, root.gridIconSize + 28 * root.zoom)
+                            height: root.gridLabelHeight
+                            visible: gridDelegate.renaming
+                            text: model.name || ""
+                            color: theme ? theme.foreground : "#e8edf7"
+                            selectionColor: theme ? theme.selection : "#24364f"
+                            selectedTextColor: theme ? theme.selection_text : "#f2f5fb"
+                            font.family: theme ? theme.font_family : "sans-serif"
+                            font.pixelSize: (root.backend && root.backend.recent_view
+                                            ? Math.max(9, root.gridLabelFontSize * 0.82)
+                                            : root.gridLabelFontSize) * (theme ? theme.font_scale : 1)
+                            verticalAlignment: TextInput.AlignVCenter
+                            horizontalAlignment: TextInput.AlignHCenter
+                            selectByMouse: true
+                            clip: true
+                            focus: gridDelegate.renaming
+
+                            function selectBase() {
+                                forceActiveFocus()
+                                var dot = text.lastIndexOf(".")
+                                select(0, dot > 0 ? dot : text.length)
+                            }
+
+                            onVisibleChanged: {
+                                if (visible)
+                                    selectBase()
+                            }
+
+                            onAccepted: {
+                                if (root.backend)
+                                    root.backend.rename(gridDelegate.entryPath, text)
+                            }
+
+                            Keys.onEscapePressed: function(event) {
+                                if (root.backend)
+                                    root.backend.cancel_rename()
+                                gridView.forceActiveFocus()
+                                event.accepted = true
+                            }
                         }
 
                     }
@@ -1804,6 +1862,8 @@ Item {
                         anchors.fill: parent
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
                         hoverEnabled: true
+                        // Let the inline rename editor keep input ownership.
+                        z: gridDelegate.renaming ? -1 : 0
 
                         property bool dragging: false
                         property bool dragStarted: false

@@ -37,6 +37,226 @@ FocusScope {
 
     signal dismissed()
 
+    // ── macOS-styled controls (visual only; behavior identical to the
+    // raw Controls.*) used throughout this dialog ──────────────────────────
+
+    // Inset text field: mirrors the ModalDialog inputs.
+    component MacTextField: Rectangle {
+        id: field
+        property alias text: fieldTextInput.text
+        property alias validator: fieldTextInput.validator
+        property string placeholder: ""
+        signal edited(string value)
+        signal committed(string value)
+        height: 28
+        radius: 6
+        color: theme ? theme.surface : "#151820"
+        border.width: 1
+        border.color: fieldTextInput.activeFocus
+                      ? ((theme ? theme.focus : "#8ab4f8") || "#8ab4f8")
+                      : (theme ? theme.border : "#292e3a")
+        opacity: enabled ? 1 : 0.55
+
+        Behavior on border.color {
+            ColorAnimation { duration: 120; easing.type: Easing.OutCubic }
+        }
+
+        TextInput {
+            id: fieldTextInput
+            anchors.fill: parent
+            anchors.leftMargin: 9
+            anchors.rightMargin: 9
+            verticalAlignment: TextInput.AlignVCenter
+            color: theme ? theme.foreground : "#e7e9ee"
+            selectionColor: theme ? theme.selection : "#24364f"
+            selectedTextColor: theme ? theme.selection_text : "#f2f5fb"
+            font.family: theme ? theme.font_family : "sans-serif"
+            font.pixelSize: 12 * (theme ? theme.font_scale : 1)
+            selectByMouse: true
+            clip: true
+            onTextEdited: field.edited(text)
+            onEditingFinished: field.committed(text)
+        }
+
+        Text {
+            anchors.left: fieldTextInput.left
+            anchors.right: fieldTextInput.right
+            anchors.verticalCenter: fieldTextInput.verticalCenter
+            visible: fieldTextInput.text === ""
+            text: field.placeholder
+            color: theme ? theme.muted : "#9299a8"
+            opacity: 0.75
+            font: fieldTextInput.font
+            elide: Text.ElideRight
+        }
+    }
+
+    // Rounded dropdown with themed list popup; drop-in replacement for
+    // Controls.ComboBox carrying the same role/value models.
+    component MacComboBox: Controls.ComboBox {
+        id: combo
+        height: 28
+        font.family: theme ? theme.font_family : "sans-serif"
+        font.pixelSize: 12 * (theme ? theme.font_scale : 1)
+
+        background: Rectangle {
+            radius: 6
+            color: theme ? theme.surface : "#151820"
+            border.width: 1
+            border.color: combo.activeFocus
+                          ? ((theme ? theme.focus : "#8ab4f8") || "#8ab4f8")
+                          : (theme ? theme.border : "#292e3a")
+
+            Behavior on border.color {
+                ColorAnimation { duration: 120; easing.type: Easing.OutCubic }
+            }
+        }
+
+        contentItem: Text {
+            leftPadding: 9
+            rightPadding: 24
+            text: combo.displayText
+            color: theme ? theme.foreground : "#e7e9ee"
+            font: combo.font
+            verticalAlignment: Text.AlignVCenter
+            elide: Text.ElideRight
+        }
+
+        indicator: Text {
+            text: "\u25be"
+            x: combo.width - width - 8
+            y: combo.height / 2 - height / 2
+            color: theme ? theme.muted : "#9299a8"
+            font.pixelSize: 11
+        }
+
+        delegate: Controls.ItemDelegate {
+            id: comboItem
+            required property var model
+            required property int index
+            width: combo.width
+            height: 26
+            highlighted: combo.highlightedIndex === index
+
+            background: Rectangle {
+                radius: 5
+                color: comboItem.hovered || comboItem.highlighted
+                       ? (theme ? theme.hover : "#202531") : "transparent"
+            }
+
+            contentItem: Text {
+                leftPadding: 8
+                rightPadding: 8
+                text: {
+                    if (combo.textRole && comboItem.model !== undefined
+                            && comboItem.model !== null
+                            && comboItem.model[combo.textRole] !== undefined)
+                        return String(comboItem.model[combo.textRole])
+                    return modelData !== undefined ? String(modelData) : ""
+                }
+                color: theme ? theme.foreground : "#e7e9ee"
+                font.family: theme ? theme.font_family : "sans-serif"
+                font.pixelSize: 12 * (theme ? theme.font_scale : 1)
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+        }
+
+        popup: Controls.Popup {
+            y: combo.height + 4
+            width: Math.max(combo.width, 176)
+            height: Math.min(contentHeight + 8, 320)
+            padding: 4
+
+            background: Rectangle {
+                color: theme ? theme.surface : "#151820"
+                border.width: 1
+                border.color: theme ? theme.border : "#292e3a"
+                radius: theme ? Math.max(6, theme.radius) : 8
+            }
+
+            contentItem: ListView {
+                clip: true
+                implicitHeight: contentHeight
+                model: combo.delegateModel
+                currentIndex: combo.highlightedIndex
+            }
+        }
+    }
+
+    // Accent pill toggle standing in for Controls.CheckBox.
+    component MacTogglePill: Rectangle {
+        id: pill
+        property string label: ""
+        property bool on: false
+        signal toggled(bool checked)
+        height: 24
+        width: pillText.implicitWidth + 18
+        radius: height / 2
+        color: pill.on
+               ? Qt.rgba(theme ? theme.accent.r : 0.54,
+                         theme ? theme.accent.g : 0.71,
+                         theme ? theme.accent.b : 0.98, 0.13)
+               : (pillMouse.containsMouse
+                  ? (theme ? theme.hover : "#202531") : "transparent")
+        border.width: 1
+        border.color: pill.on
+                      ? Qt.rgba(theme ? theme.accent.r : 0.54,
+                                theme ? theme.accent.g : 0.71,
+                                theme ? theme.accent.b : 0.98, 0.55)
+                      : "transparent"
+        opacity: enabled ? 1 : 0.5
+
+        Behavior on color { ColorAnimation { duration: 120; easing.type: Easing.OutCubic } }
+        Behavior on border.color { ColorAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
+        Text {
+            id: pillText
+            anchors.centerIn: parent
+            text: pill.label
+            color: pill.on
+                   ? (theme ? theme.accent : "#8ab4f8")
+                   : (theme ? theme.foreground : "#e7e9ee")
+            font.family: theme ? theme.font_family : "sans-serif"
+            font.pixelSize: 10.5 * (theme ? theme.font_scale : 1)
+        }
+
+        MouseArea {
+            id: pillMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            Accessible.role: Accessible.CheckBox
+            Accessible.name: pill.label
+            Accessible.checked: pill.on
+            onClicked: pill.toggled(!pill.on)
+        }
+    }
+
+    // Tiny uppercase section marker.
+    component SectionMarker: Text {
+        font.family: theme ? theme.font_family : "sans-serif"
+        font.pixelSize: 9.5 * (theme ? theme.font_scale : 1)
+        font.weight: Font.DemiBold
+        font.capitalization: Font.AllUppercase
+        color: theme ? theme.muted : "#9299a8"
+    }
+
+    // Colored status dot for preview rows.
+    component StatusDot: Rectangle {
+        property string status: ""
+        width: 7
+        height: 7
+        radius: height / 2
+        anchors.verticalCenter: parent.verticalCenter
+        color: status === "Conflict" || status === "Invalid"
+               || status.indexOf("Recovery") >= 0
+               ? (theme ? theme.danger : "#e06c75")
+               : status === "Renamed"
+                 ? (theme ? theme.accent : "#8ab4f8")
+                 : (theme ? theme.border : "#292e3a")
+    }
+
     readonly property var operationTypes: [
         { label: "Find and replace", value: "replace" },
         { label: "Add prefix", value: "prefix" },
@@ -314,48 +534,64 @@ FocusScope {
         border.width: 1
         border.color: theme ? theme.border : "#292e3a"
 
+        Behavior on opacity { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
+        // macOS-style close affordance pinned to the dialog's top-right corner.
+        Rectangle {
+            width: 28
+            height: 28
+            radius: height / 2
+            z: 5
+            anchors.top: parent.top
+            anchors.right: parent.right
+            anchors.topMargin: 10
+            anchors.rightMargin: 10
+            color: closeMouse.containsMouse ? (theme ? theme.danger : "#e06c75") : "transparent"
+
+            Behavior on color { ColorAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
+            Text {
+                anchors.centerIn: parent
+                text: "\u00d7"
+                color: closeMouse.containsMouse
+                       ? (theme ? theme.surface : "#151820")
+                       : (theme ? theme.muted : "#9299a8")
+                font.pixelSize: 19 * (theme ? theme.font_scale : 1)
+            }
+            MouseArea {
+                id: closeMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.close()
+            }
+        }
+
         ColumnLayout {
             anchors.fill: parent
-            anchors.margins: 20
+            anchors.margins: 22
             spacing: 12
 
-            RowLayout {
+            ColumnLayout {
                 Layout.fillWidth: true
-                spacing: 12
-                ColumnLayout {
+                Layout.rightMargin: 30
+                spacing: 3
+                Text {
                     Layout.fillWidth: true
-                    spacing: 3
-                    Text {
-                        text: "Batch Rename"
-                        color: theme ? theme.foreground : "#e7e9ee"
-                        font.family: theme ? theme.font_family : "sans-serif"
-                        font.pixelSize: 20 * (theme ? theme.font_scale : 1)
-                        font.weight: Font.DemiBold
-                    }
-                    Text {
-                        text: root.paths.length + " selected items · Preview changes without touching files"
-                        color: theme ? theme.muted : "#9299a8"
-                        font.family: theme ? theme.font_family : "sans-serif"
-                        font.pixelSize: 12 * (theme ? theme.font_scale : 1)
-                    }
+                    text: "Batch Rename"
+                    elide: Text.ElideRight
+                    color: theme ? theme.foreground : "#e7e9ee"
+                    font.family: theme ? theme.font_family : "sans-serif"
+                    font.pixelSize: 20 * (theme ? theme.font_scale : 1)
+                    font.weight: Font.DemiBold
                 }
-                Rectangle {
-                    width: 30
-                    height: 30
-                    radius: 7
-                    color: closeMouse.containsMouse ? (theme ? theme.hover : "#202531") : "transparent"
-                    Text {
-                        anchors.centerIn: parent
-                        text: "\u00d7"
-                        color: theme ? theme.foreground : "#e7e9ee"
-                        font.pixelSize: 20 * (theme ? theme.font_scale : 1)
-                    }
-                    MouseArea {
-                        id: closeMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        onClicked: root.close()
-                    }
+                Text {
+                    Layout.fillWidth: true
+                    text: root.paths.length + " selected items\u00a0\u00b7 Preview changes without touching files"
+                    elide: Text.ElideRight
+                    color: theme ? theme.muted : "#9299a8"
+                    font.family: theme ? theme.font_family : "sans-serif"
+                    font.pixelSize: 12 * (theme ? theme.font_scale : 1)
                 }
             }
 
@@ -363,39 +599,55 @@ FocusScope {
                 Layout.fillWidth: true
                 height: 1
                 color: theme ? theme.border : "#292e3a"
+                opacity: 0.7
             }
 
             RowLayout {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 34
-                Text {
-                    text: "Rename operations"
-                    color: theme ? theme.foreground : "#e7e9ee"
-                    font.family: theme ? theme.font_family : "sans-serif"
-                    font.pixelSize: 13 * (theme ? theme.font_scale : 1)
-                    font.weight: Font.DemiBold
-                }
+                Layout.preferredHeight: 30
+                SectionMarker { text: "Rename operations" }
                 Item { Layout.fillWidth: true }
                 Rectangle {
-                    width: addRuleLabel.implicitWidth + 24
-                    height: 30
-                    radius: 6
-                    color: addRuleMouse.containsMouse ? (theme ? theme.hover : "#202531")
-                                                      : (theme ? theme.surface_alt : "#1c202a")
+                    width: addRuleRow.implicitWidth + 20
+                    height: 28
+                    radius: height / 2
+                    color: addRuleMouse.containsMouse
+                           ? Qt.rgba(theme ? theme.accent.r : 0.54,
+                                     theme ? theme.accent.g : 0.71,
+                                     theme ? theme.accent.b : 0.98, 0.16)
+                           : (theme ? theme.surface_alt : "#1c202a")
                     border.width: 1
-                    border.color: theme ? theme.border : "#292e3a"
-                    Text {
-                        id: addRuleLabel
+                    border.color: addRuleMouse.containsMouse
+                                  ? Qt.rgba(theme ? theme.accent.r : 0.54,
+                                            theme ? theme.accent.g : 0.71,
+                                            theme ? theme.accent.b : 0.98, 0.6)
+                                  : (theme ? theme.border : "#292e3a")
+
+                    Behavior on color { ColorAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
+                    Row {
+                        id: addRuleRow
                         anchors.centerIn: parent
-                        text: "+ Add rule"
-                        color: theme ? theme.foreground : "#e7e9ee"
-                        font.family: theme ? theme.font_family : "sans-serif"
-                        font.pixelSize: 12 * (theme ? theme.font_scale : 1)
+                        spacing: 6
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "+"
+                            color: theme ? theme.accent : "#8ab4f8"
+                            font.pixelSize: 14 * (theme ? theme.font_scale : 1)
+                        }
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Add rule"
+                            color: theme ? theme.foreground : "#e7e9ee"
+                            font.family: theme ? theme.font_family : "sans-serif"
+                            font.pixelSize: 12 * (theme ? theme.font_scale : 1)
+                        }
                     }
                     MouseArea {
                         id: addRuleMouse
                         anchors.fill: parent
                         hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
                         enabled: !root.executing && !root.completed
                         onClicked: root.addRule()
                     }
@@ -435,7 +687,7 @@ FocusScope {
                                 RowLayout {
                                     Layout.fillWidth: true
                                     spacing: 7
-                                    Controls.ComboBox {
+                                    MacComboBox {
                                         Layout.preferredWidth: 190
                                         model: root.operationTypes
                                         textRole: "label"
@@ -444,81 +696,84 @@ FocusScope {
                                             root.updateRule(index, "type",
                                                             root.operationTypes[index].value)
                                         }
-                                        contentItem: Text {
-                                            leftPadding: 9
-                                            text: parent.displayText
-                                            color: theme ? theme.foreground : "#e7e9ee"
-                                            font.family: theme ? theme.font_family : "sans-serif"
-                                            font.pixelSize: 12 * (theme ? theme.font_scale : 1)
-                                            verticalAlignment: Text.AlignVCenter
-                                            elide: Text.ElideRight
-                                        }
-                                        background: Rectangle {
-                                            radius: 5
-                                            color: theme ? theme.surface : "#151820"
-                                            border.color: theme ? theme.border : "#292e3a"
-                                        }
                                     }
-                                    Controls.TextField {
+                                    MacTextField {
                                         Layout.fillWidth: true
                                         visible: modelData.type === "replace"
-                                        placeholderText: "Find"
+                                        placeholder: "Find"
                                         text: modelData.find
-                                        onTextEdited: root.updateRule(index, "find", text)
+                                        onEdited: function(value) {
+                                            root.updateRule(index, "find", value)
+                                        }
                                     }
-                                    Controls.TextField {
+                                    MacTextField {
                                         Layout.fillWidth: true
                                         visible: modelData.type === "replace"
-                                        placeholderText: "Replace with"
+                                        placeholder: "Replace with"
                                         text: modelData.replace
-                                        onTextEdited: root.updateRule(index, "replace", text)
+                                        onEdited: function(value) {
+                                            root.updateRule(index, "replace", value)
+                                        }
                                     }
-                                    Controls.TextField {
+                                    MacTextField {
                                         Layout.fillWidth: true
                                         visible: ["prefix", "suffix", "removeText"].indexOf(modelData.type) >= 0
-                                        placeholderText: modelData.type === "prefix" ? "Prefix"
-                                                         : modelData.type === "suffix" ? "Suffix" : "Text to remove"
+                                        placeholder: modelData.type === "prefix" ? "Prefix"
+                                                    : modelData.type === "suffix" ? "Suffix" : "Text to remove"
                                         text: modelData.text
-                                        onTextEdited: root.updateRule(index, "text", text)
+                                        onEdited: function(value) {
+                                            root.updateRule(index, "text", value)
+                                        }
                                     }
-                                    Controls.TextField {
+                                    MacTextField {
                                         Layout.preferredWidth: 95
                                         visible: modelData.type === "replaceSpaces"
-                                        placeholderText: "Separator"
+                                        placeholder: "Separator"
                                         text: modelData.separator
-                                        onTextEdited: root.updateRule(index, "separator", text)
+                                        onEdited: function(value) {
+                                            root.updateRule(index, "separator", value)
+                                        }
                                     }
-                                    Controls.TextField {
+                                    MacTextField {
                                         Layout.preferredWidth: 80
                                         visible: modelData.type === "removeRange"
-                                        placeholderText: "Start (0-based)"
+                                        placeholder: "Start"
                                         text: String(modelData.start)
                                         validator: IntValidator { bottom: 0 }
-                                        onEditingFinished: root.updateRule(index, "start", Math.max(0, Number(text)))
+                                        onCommitted: function(value) {
+                                            root.updateRule(index, "start", Math.max(0, Number(value)))
+                                        }
                                     }
-                                    Controls.TextField {
+                                    MacTextField {
                                         Layout.preferredWidth: 72
                                         visible: modelData.type === "removeRange"
-                                        placeholderText: "Length"
+                                        placeholder: "Length"
                                         text: String(modelData.length)
                                         validator: IntValidator { bottom: 0 }
-                                        onEditingFinished: root.updateRule(index, "length", Math.max(0, Number(text)))
+                                        onCommitted: function(value) {
+                                            root.updateRule(index, "length", Math.max(0, Number(value)))
+                                        }
                                     }
                                     Rectangle {
                                         width: 26
                                         height: 26
-                                        radius: 5
-                                        color: removeRuleMouse.containsMouse ? (theme ? theme.hover : "#202531") : "transparent"
+                                        radius: height / 2
+                                        color: removeRuleMouse.containsMouse
+                                               ? (theme ? theme.danger : "#e06c75") : "transparent"
                                         Text {
                                             anchors.centerIn: parent
                                             text: "\u2212"
-                                            color: theme ? theme.muted : "#9299a8"
+                                            color: removeRuleMouse.containsMouse
+                                                   ? (theme ? theme.surface : "#151820")
+                                                   : (theme ? theme.muted : "#9299a8")
                                             font.pixelSize: 18 * (theme ? theme.font_scale : 1)
                                         }
                                         MouseArea {
                                             id: removeRuleMouse
                                             anchors.fill: parent
                                             hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            enabled: !root.executing && !root.completed
                                             onClicked: root.removeRule(index)
                                         }
                                     }
@@ -526,28 +781,36 @@ FocusScope {
                                 RowLayout {
                                     Layout.fillWidth: true
                                     visible: modelData.type === "replace" || modelData.type === "removeText"
-                                    spacing: 12
-                                    Controls.CheckBox {
-                                        text: "Case sensitive"
-                                        checked: modelData.caseSensitive
-                                        onToggled: root.updateRule(index, "caseSensitive", checked)
+                                    spacing: 6
+                                    MacTogglePill {
+                                        label: "Case sensitive"
+                                        on: modelData.caseSensitive
+                                        onToggled: function(checked) {
+                                            root.updateRule(index, "caseSensitive", checked)
+                                        }
                                     }
-                                    Controls.CheckBox {
-                                        text: "Whole word"
-                                        checked: modelData.wholeWord
-                                        onToggled: root.updateRule(index, "wholeWord", checked)
+                                    MacTogglePill {
+                                        label: "Whole word"
+                                        on: modelData.wholeWord
+                                        onToggled: function(checked) {
+                                            root.updateRule(index, "wholeWord", checked)
+                                        }
                                     }
-                                    Controls.CheckBox {
+                                    MacTogglePill {
                                         visible: modelData.type === "replace"
-                                        text: "Regular expression"
-                                        checked: modelData.regex
-                                        onToggled: root.updateRule(index, "regex", checked)
+                                        label: "Regular expression"
+                                        on: modelData.regex
+                                        onToggled: function(checked) {
+                                            root.updateRule(index, "regex", checked)
+                                        }
                                     }
-                                    Controls.CheckBox {
+                                    MacTogglePill {
                                         visible: modelData.type === "replace"
-                                        text: "Include extension"
-                                        checked: modelData.includeExtension
-                                        onToggled: root.updateRule(index, "includeExtension", checked)
+                                        label: "Include extension"
+                                        on: modelData.includeExtension
+                                        onToggled: function(checked) {
+                                            root.updateRule(index, "includeExtension", checked)
+                                        }
                                     }
                                 }
                             }
@@ -577,52 +840,50 @@ FocusScope {
                 columnSpacing: 12
                 rowSpacing: 8
 
-                Text {
-                    text: "Template"
-                    color: theme ? theme.foreground : "#e7e9ee"
-                    font.pixelSize: 12 * (theme ? theme.font_scale : 1)
-                }
-                Controls.TextField {
+                SectionMarker { text: "Template" }
+                MacTextField {
                     Layout.fillWidth: true
-                    placeholderText: "{counter:03}_{name}_{date}"
+                    placeholder: "{counter:03}_{name}_{date}"
                     text: root.templateText
-                    onTextEdited: root.setOption("templateText", text)
+                    onEdited: function(value) { root.setOption("templateText", value) }
                 }
-                Text {
-                    text: "Sequence"
-                    color: theme ? theme.foreground : "#e7e9ee"
-                    font.pixelSize: 12 * (theme ? theme.font_scale : 1)
-                }
+                SectionMarker { text: "Sequence" }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 6
-                    Controls.CheckBox {
-                        text: "Add numbering"
-                        checked: root.numbering
-                        onToggled: root.setOption("numbering", checked)
+                    MacTogglePill {
+                        label: "Add numbering"
+                        on: root.numbering
+                        onToggled: function(checked) { root.setOption("numbering", checked) }
                     }
-                    Controls.TextField {
+                    MacTextField {
                         Layout.preferredWidth: 64
                         enabled: root.numbering
                         text: String(root.numberStart)
                         validator: IntValidator { bottom: 0 }
-                        onEditingFinished: root.setOption("numberStart", Math.max(0, Number(text)))
+                        onCommitted: function(value) {
+                            root.setOption("numberStart", Math.max(0, Number(value)))
+                        }
                     }
-                    Controls.TextField {
+                    MacTextField {
                         Layout.preferredWidth: 56
                         enabled: root.numbering
                         text: String(root.numberStep)
                         validator: IntValidator { bottom: 1 }
-                        onEditingFinished: root.setOption("numberStep", Math.max(1, Number(text)))
+                        onCommitted: function(value) {
+                            root.setOption("numberStep", Math.max(1, Number(value)))
+                        }
                     }
-                    Controls.TextField {
+                    MacTextField {
                         Layout.preferredWidth: 54
                         enabled: root.numbering
                         text: String(root.numberPadding)
                         validator: IntValidator { bottom: 0; top: 128 }
-                        onEditingFinished: root.setOption("numberPadding", Math.max(0, Math.min(128, Number(text))))
+                        onCommitted: function(value) {
+                            root.setOption("numberPadding", Math.max(0, Math.min(128, Number(value))))
+                        }
                     }
-                    Controls.ComboBox {
+                    MacComboBox {
                         Layout.preferredWidth: 125
                         enabled: root.numbering
                         model: [
@@ -635,22 +896,18 @@ FocusScope {
                                       : root.numberPlacement === "template" ? 2 : 0
                         onActivated: function(index) { root.setOption("numberPlacement", model[index].value) }
                     }
-                    Controls.TextField {
+                    MacTextField {
                         Layout.preferredWidth: 64
                         enabled: root.numbering && root.numberPlacement !== "template"
                         text: root.numberSeparator
-                        onTextEdited: root.setOption("numberSeparator", text)
+                        onEdited: function(value) { root.setOption("numberSeparator", value) }
                     }
                 }
-                Text {
-                    text: "Extension"
-                    color: theme ? theme.foreground : "#e7e9ee"
-                    font.pixelSize: 12 * (theme ? theme.font_scale : 1)
-                }
+                SectionMarker { text: "Extension" }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 6
-                    Controls.ComboBox {
+                    MacComboBox {
                         Layout.preferredWidth: 150
                         model: [
                             { label: "Preserve", value: "preserve" },
@@ -662,23 +919,19 @@ FocusScope {
                                       : root.extensionMode === "remove" ? 2 : 0
                         onActivated: function(index) { root.setOption("extensionMode", model[index].value) }
                     }
-                    Controls.TextField {
+                    MacTextField {
                         Layout.preferredWidth: 100
                         visible: root.extensionMode === "change"
-                        placeholderText: "png"
+                        placeholder: "png"
                         text: root.extensionText
-                        onTextEdited: root.setOption("extensionText", text)
+                        onEdited: function(value) { root.setOption("extensionText", value) }
                     }
                 }
-                Text {
-                    text: "Order"
-                    color: theme ? theme.foreground : "#e7e9ee"
-                    font.pixelSize: 12 * (theme ? theme.font_scale : 1)
-                }
+                SectionMarker { text: "Order" }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 8
-                    Controls.ComboBox {
+                    MacComboBox {
                         Layout.preferredWidth: 155
                         model: [
                             { label: "Selection order", value: "selection" },
@@ -692,21 +945,22 @@ FocusScope {
                                       : root.sortOrder === "created" ? 3 : 0
                         onActivated: function(index) { root.setOption("sortOrder", model[index].value) }
                     }
-                    Controls.CheckBox {
-                        text: "Descending"
-                        checked: root.descending
-                        onToggled: root.setOption("descending", checked)
+                    MacTogglePill {
+                        label: "Descending"
+                        on: root.descending
+                        onToggled: function(checked) { root.setOption("descending", checked) }
                     }
-                    Controls.CheckBox {
-                        text: "Case-insensitive collisions"
-                        checked: root.caseInsensitive
-                        onToggled: root.setOption("caseInsensitive", checked)
+                    MacTogglePill {
+                        label: "Case-insensitive collisions"
+                        on: root.caseInsensitive
+                        onToggled: function(checked) { root.setOption("caseInsensitive", checked) }
                     }
                 }
                 Text {
                     Layout.columnSpan: 2
                     text: "Variables: {name}, {ext}, {index}, {counter:03}, {date}, {modified}, {parent} · *When supported by the filesystem"
                     color: theme ? theme.muted : "#9299a8"
+                    font.family: theme ? theme.font_family : "sans-serif"
                     font.pixelSize: 10 * (theme ? theme.font_scale : 1)
                     elide: Text.ElideRight
                 }
@@ -714,30 +968,31 @@ FocusScope {
 
             RowLayout {
                 Layout.fillWidth: true
-                Text {
-                    text: "Preview"
-                    color: theme ? theme.foreground : "#e7e9ee"
-                    font.pixelSize: 13 * (theme ? theme.font_scale : 1)
-                    font.weight: Font.DemiBold
+                SectionMarker { text: "Preview" }
+                Rectangle {
+                    width: 1
+                    height: 10
+                    color: theme ? theme.border : "#292e3a"
                 }
-                Item { Layout.fillWidth: true }
                 Text {
                     text: root.previewBusy ? "Calculating\u2026"
-                          : root.affectedCount + " to rename  ·  " + root.unchangedCount + " unchanged  ·  "
-                            + root.excludedCount + " excluded  ·  " + root.conflictCount + " conflicts  ·  "
+                          : root.affectedCount + " to rename  \u00b7  " + root.unchangedCount + " unchanged  \u00b7  "
+                            + root.excludedCount + " excluded  \u00b7  " + root.conflictCount + " conflicts  \u00b7  "
                             + root.invalidCount + " invalid"
                     color: root.conflictCount + root.invalidCount > 0
                            ? (theme ? theme.danger : "#e06c75")
                            : (theme ? theme.muted : "#9299a8")
+                    font.family: theme ? theme.font_family : "sans-serif"
                     font.pixelSize: 11 * (theme ? theme.font_scale : 1)
                 }
+                Item { Layout.fillWidth: true }
             }
 
             Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 Layout.minimumHeight: 80
-                radius: 7
+                radius: 8
                 color: theme ? theme.surface_alt : "#1c202a"
                 border.width: 1
                 border.color: theme ? theme.border : "#292e3a"
@@ -750,9 +1005,15 @@ FocusScope {
                         Layout.fillWidth: true
                         Layout.preferredHeight: 26
                         Text { Layout.preferredWidth: 28; text: ""; }
-                        Text { Layout.fillWidth: true; text: "Original"; color: theme ? theme.muted : "#9299a8"; font.pixelSize: 10 * (theme ? theme.font_scale : 1) }
-                        Text { Layout.fillWidth: true; text: "Proposed name"; color: theme ? theme.muted : "#9299a8"; font.pixelSize: 10 * (theme ? theme.font_scale : 1) }
-                        Text { Layout.preferredWidth: 126; text: "Status"; color: theme ? theme.muted : "#9299a8"; font.pixelSize: 10 * (theme ? theme.font_scale : 1) }
+                        SectionMarker { Layout.fillWidth: true; text: "Original" }
+                        SectionMarker { Layout.fillWidth: true; text: "Proposed name" }
+                        SectionMarker { Layout.preferredWidth: 126; text: "Status" }
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true
+                        height: 1
+                        color: theme ? theme.border : "#292e3a"
+                        opacity: 0.6
                     }
                     ListView {
                         id: previewList
@@ -763,29 +1024,45 @@ FocusScope {
                         model: backend ? backend.batch_preview_rows : []
                         delegate: Rectangle {
                             required property var modelData
+                            id: previewRow
                             width: previewList.width
                             height: Math.max(27, statusText.implicitHeight + 8)
-                            color: "transparent"
+                            radius: 5
+                            color: rowHover.containsMouse
+                                   ? (theme ? theme.hover : "#202531") : "transparent"
+
+                            Behavior on color { ColorAnimation { duration: 100; easing.type: Easing.OutCubic } }
+
+                            MouseArea {
+                                id: rowHover
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                acceptedButtons: Qt.NoButton
+                            }
                             RowLayout {
                                 anchors.fill: parent
+                                anchors.leftMargin: 4
+                                anchors.rightMargin: 4
                                 spacing: 8
                                 Rectangle {
                                     Layout.preferredWidth: 18
                                     Layout.preferredHeight: 18
-                                    radius: 4
+                                    radius: 5
                                     color: modelData.included ? (theme ? theme.selection : "#24364f") : "transparent"
                                     border.width: 1
-                                    border.color: theme ? theme.border : "#292e3a"
+                                    border.color: modelData.included
+                                                  ? "transparent" : (theme ? theme.border : "#292e3a")
                                     Text {
                                         anchors.centerIn: parent
                                         visible: modelData.included
                                         text: "\u2713"
                                         color: theme ? theme.selection_text : "#f2f5fb"
-                                        font.pixelSize: 12 * (theme ? theme.font_scale : 1)
+                                        font.pixelSize: 11 * (theme ? theme.font_scale : 1)
                                     }
                                     MouseArea {
                                         anchors.fill: parent
                                         enabled: !root.executing && !root.completed
+                                        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
                                         onClicked: root.toggleIncluded(modelData.path)
                                     }
                                 }
@@ -811,18 +1088,24 @@ FocusScope {
                                 }
                                 ColumnLayout {
                                     Layout.preferredWidth: 126
-                                    spacing: 0
-                                    Text {
-                                        id: statusText
-                                        text: modelData.status
-                                        color: modelData.status === "Conflict" || modelData.status === "Invalid"
-                                               || modelData.status.indexOf("Recovery") >= 0
-                                               ? (theme ? theme.danger : "#e06c75")
-                                               : modelData.status === "Renamed"
-                                                 ? (theme ? theme.accent : "#8ab4f8")
-                                                 : (theme ? theme.muted : "#9299a8")
-                                        font.pixelSize: 10 * (theme ? theme.font_scale : 1)
-                                        elide: Text.ElideRight
+                                    spacing: 2
+                                    Row {
+                                        spacing: 6
+                                        StatusDot { status: modelData.status }
+                                        Text {
+                                            id: statusText
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: modelData.status
+                                            color: modelData.status === "Conflict" || modelData.status === "Invalid"
+                                                   || modelData.status.indexOf("Recovery") >= 0
+                                                   ? (theme ? theme.danger : "#e06c75")
+                                                   : modelData.status === "Renamed"
+                                                     ? (theme ? theme.accent : "#8ab4f8")
+                                                     : (theme ? theme.muted : "#9299a8")
+                                            font.family: theme ? theme.font_family : "sans-serif"
+                                            font.pixelSize: 10 * (theme ? theme.font_scale : 1)
+                                            elide: Text.ElideRight
+                                        }
                                     }
                                     Text {
                                         visible: modelData.reason !== ""
@@ -891,23 +1174,28 @@ FocusScope {
                 }
                 Rectangle {
                     width: cancelLabel.implicitWidth + 28
-                    height: 34
-                    radius: 6
+                    height: 32
+                    radius: height / 2
                     color: cancelMouse.containsMouse ? (theme ? theme.hover : "#202531")
-                                                     : (theme ? theme.surface_alt : "#1c202a")
+                                                     : "transparent"
                     border.width: 1
                     border.color: theme ? theme.border : "#292e3a"
+
+                    Behavior on color { ColorAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
                     Text {
                         id: cancelLabel
                         anchors.centerIn: parent
                         text: root.executing ? "Cancel safely" : root.completed ? "Done" : "Cancel"
                         color: theme ? theme.foreground : "#e7e9ee"
+                        font.family: theme ? theme.font_family : "sans-serif"
                         font.pixelSize: 12 * (theme ? theme.font_scale : 1)
                     }
                     MouseArea {
                         id: cancelMouse
                         anchors.fill: parent
                         hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
                         onClicked: {
                             if (root.executing)
                                 backend.cancel_operation()
@@ -918,24 +1206,36 @@ FocusScope {
                 }
                 Rectangle {
                     visible: !root.completed
-                    width: renameLabel.implicitWidth + 28
-                    height: 34
-                    radius: 6
+                    width: renameLabel.implicitWidth + 32
+                    height: 32
+                    radius: height / 2
                     opacity: root.canExecute ? 1 : 0.45
-                    color: root.canExecute ? (theme ? theme.selection : "#24364f")
-                                           : (theme ? theme.surface_alt : "#1c202a")
+                    color: root.canExecute
+                           ? (renameMouse.containsMouse
+                              ? (theme ? theme.accent : "#8ab4f8")
+                              : (theme ? theme.selection : "#24364f"))
+                           : (theme ? theme.surface_alt : "#1c202a")
                     border.width: 1
-                    border.color: theme ? theme.border : "#292e3a"
+                    border.color: root.canExecute ? "transparent"
+                                                  : (theme ? theme.border : "#292e3a")
+
+                    Behavior on color { ColorAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
                     Text {
                         id: renameLabel
                         anchors.centerIn: parent
                         text: root.executing ? "Renaming\u2026" : "Rename " + root.affectedCount + " items"
-                        color: theme ? theme.selection_text : "#f2f5fb"
+                        color: root.canExecute ? (theme ? theme.selection_text : "#f2f5fb")
+                                               : (theme ? theme.muted : "#9299a8")
+                        font.family: theme ? theme.font_family : "sans-serif"
                         font.pixelSize: 12 * (theme ? theme.font_scale : 1)
+                        font.weight: root.canExecute ? Font.DemiBold : Font.Normal
                     }
                     MouseArea {
+                        id: renameMouse
                         anchors.fill: parent
                         enabled: root.canExecute
+                        cursorShape: Qt.PointingHandCursor
                         onClicked: root.execute()
                     }
                 }

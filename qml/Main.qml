@@ -50,11 +50,13 @@ Window {
     property string pendingExtractPath: ""
     property var pendingTagPaths: []
     property var pendingCompressPaths: []
+    property var pendingConvertPaths: []
 
     readonly property bool dialogOpen: promptDialog.open || confirmDialog.open || conflictDialog.open
                                         || unlockDialog.open || openWithDialog.open
                                         || tagPicker.open
                                         || compressDialog.open
+                                        || imageConvertDialog.open
                                         || batchRenameDialog.open
                                         || appearanceDialog.open
                                         || performanceDialog.open
@@ -824,6 +826,18 @@ Window {
                             compressDialog.itemCount = paths.length
                             compressDialog.open = true
                         }
+                        onRequestConvert: function(paths) {
+                            root.pendingConvertPaths = paths
+                            var formats = backend.image_output_formats()
+                            if (formats.length === 0) {
+                                root.pendingConvertPaths = []
+                                root.focusList()
+                                return
+                            }
+                            imageConvertDialog.formats = formats
+                            imageConvertDialog.itemCount = paths.length
+                            imageConvertDialog.open = true
+                        }
                         onRequestSearch: function(query) {
                             root.openSearchForText(query)
                         }
@@ -949,6 +963,20 @@ Window {
         }
         onCanceled: {
             root.pendingCompressPaths = []
+            root.focusList()
+        }
+    }
+
+    ImageConvertDialog {
+        id: imageConvertDialog
+        theme: theme
+        onChosen: function(format) {
+            backend.convert_images(root.pendingConvertPaths, format)
+            root.pendingConvertPaths = []
+            root.focusList()
+        }
+        onCanceled: {
+            root.pendingConvertPaths = []
             root.focusList()
         }
     }

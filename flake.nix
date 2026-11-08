@@ -88,7 +88,7 @@
           "--prefix QML_IMPORT_PATH : ${qt}/lib/qt-6/qml"
           "--prefix LD_LIBRARY_PATH : ${qt}/lib"
           "--prefix LD_LIBRARY_PATH : ${pkgs.glib}/lib"
-          "--prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ffmpeg pkgs.poppler-utils pkgs.p7zip pkgs.file pkgs.exiftool pkgs.glib.bin pkgs.gvfs pkgs.udisks pkgs.util-linux pkgs.systemd pkgs.bzip2 pkgs.xz pkgs.zstd ]}"
+          "--prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ffmpeg pkgs.imagemagick pkgs.libnotify pkgs.poppler-utils pkgs.p7zip pkgs.file pkgs.exiftool pkgs.glib.bin pkgs.gvfs pkgs.udisks pkgs.util-linux pkgs.systemd pkgs.bzip2 pkgs.xz pkgs.zstd ]}"
           "--prefix GIO_EXTRA_MODULES : ${pkgs.gvfs}/lib/gio/modules"
           "--prefix XDG_DATA_DIRS : ${pkgs.gvfs}/share"
           "--prefix XDG_DATA_DIRS : ${pkgs.shared-mime-info}/share"
@@ -129,6 +129,8 @@
           pkgs.pkg-config
           pkgs.qt6.qtmultimedia
           pkgs.ffmpeg
+          pkgs.imagemagick
+          pkgs.libnotify
           pkgs.poppler-utils
           pkgs.p7zip
           pkgs.file

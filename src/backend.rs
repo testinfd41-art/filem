@@ -28,7 +28,9 @@ use crate::fs_entry::{
     SortSpec,
 };
 use crate::icons::{icon_names_for, IconResolver};
+use crate::image_conversion;
 use crate::metadata::{self, MetadataReport};
+use crate::notifications;
 use crate::ops::{self, ConflictPolicy, RedoOp, TrashItem, UndoOp};
 use crate::paths::{self, breadcrumbs, format_size, home_dir, trash_dir, user_places, Place};
 use crate::preview;
@@ -427,6 +429,55 @@ fn is_virtual_collection(path: &Path) -> bool {
     is_recent_path(path) || is_tag_collection_path(path)
 }
 
+/// The shell a terminal should start for this user.
+///
+/// Terminal emulators launch `$SHELL`, and Filem passes its environment along.
+/// Development shells (`nix develop`) export a non-interactive bash build there,
+/// which lacks `progcomp` and does not treat `\[`/`\]` as non-printing prompt
+/// markers, so "Open Terminal Here" would otherwise inherit a broken prompt.
+/// Resolve the login shell from passwd instead.
+fn login_shell() -> Option<String> {
+    let uid = unsafe { libc::getuid() };
+    let entry = unsafe { libc::getpwuid(uid) };
+    if entry.is_null() {
+        return None;
+    }
+    let shell = unsafe { (*entry).pw_shell };
+    if shell.is_null() {
+        return None;
+    }
+    let shell = unsafe { std::ffi::CStr::from_ptr(shell) }
+        .to_string_lossy()
+        .into_owned();
+    let shell = shell.trim();
+    let path = Path::new(shell);
+    if shell.is_empty() || !path.is_absolute() || !path.exists() {
+        None
+    } else {
+        Some(shell.to_owned())
+    }
+}
+
+/// Build the command that launches the configured terminal in `directory`.
+///
+/// The terminal binary is a single configured name; the path is an argument,
+/// never a shell string.
+fn terminal_command(terminal: &str, directory: &Path) -> Command {
+    let mut command = Command::new(terminal);
+    command
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // A terminal emulator starts `$SHELL`. Point it at the login shell so a
+    // development-shell environment cannot substitute a non-interactive bash;
+    // keep the inherited value only when passwd cannot be resolved.
+    if let Some(shell) = login_shell() {
+        command.env("SHELL", shell);
+    }
+    command
+}
+
 fn same_filesystem_selection(sources: &[PathBuf], destination: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -551,6 +602,8 @@ struct OpTick {
     detail: String,
     progress: f64,
 }
+
+type OperationProgress = Box<dyn FnMut(String, f64) + Send>;
 
 struct TransferFinished {
     undo: Option<UndoOp>,
@@ -1125,6 +1178,9 @@ pub struct Backend {
     open_with_app: qt_method!(fn(&mut self, app_id: QString, paths: QVariantList)),
     default_app_name: qt_method!(fn(&self, path: QString) -> QString),
     is_archive: qt_method!(fn(&self, path: QString) -> bool),
+    is_image_file: qt_method!(fn(&self, path: QString) -> bool),
+    image_output_formats: qt_method!(fn(&mut self) -> QVariantList),
+    convert_images: qt_method!(fn(&mut self, paths: QVariantList, format: QString)),
     compress_paths:
         qt_method!(fn(&mut self, paths: QVariantList, format: QString, password: QString)),
     extract_path: qt_method!(fn(&mut self, path: QString, destination: QString)),
@@ -1405,6 +1461,9 @@ impl Default for Backend {
             open_with_app: Default::default(),
             default_app_name: Default::default(),
             is_archive: Default::default(),
+            is_image_file: Default::default(),
+            image_output_formats: Default::default(),
+            convert_images: Default::default(),
             compress_paths: Default::default(),
             extract_path: Default::default(),
             set_tag: Default::default(),
@@ -2458,10 +2517,47 @@ impl Backend {
         ops::archive_format(Path::new(&path.to_string())).is_some()
     }
 
+    fn is_image_file(&self, path: QString) -> bool {
+        image_conversion::is_image_file(Path::new(&path.to_string()))
+    }
+
+    fn image_output_formats(&mut self) -> QVariantList {
+        match image_conversion::available_formats() {
+            Ok(formats) => {
+                let mut list = QVariantList::default();
+                for format in formats {
+                    list.push(QVariant::from(QString::from(format)));
+                }
+                list
+            }
+            Err(error) => {
+                self.set_error(error);
+                QVariantList::default()
+            }
+        }
+    }
+
+    fn convert_images(&mut self, paths: QVariantList, format: QString) {
+        let sources = list_paths(&paths);
+        if sources.is_empty() {
+            self.set_error("Select at least one image to convert.");
+            return;
+        }
+        let format = format.to_string();
+        self.run_archive_action(
+            format!("Converting {} images", sources.len()),
+            move |cancel, mut progress| {
+                image_conversion::convert_images(&sources, &format, &cancel, &mut *progress)
+            },
+        );
+    }
+
     fn run_archive_action(
         &mut self,
         title: String,
-        action: impl FnOnce(Arc<AtomicBool>) -> Result<String, String> + Send + 'static,
+        action: impl FnOnce(Arc<AtomicBool>, OperationProgress) -> Result<String, String>
+            + Send
+            + 'static,
     ) {
         if self.non_transfer_operation_busy() {
             self.set_error("Wait for the current file operation to finish first.");
@@ -2482,15 +2578,46 @@ impl Backend {
                 backend.finish_operation();
                 match result {
                     Ok(message) => {
+                        notifications::send("File operation complete", message.clone());
                         backend.status = QString::from(message);
                         backend.status_changed();
                         backend.refresh();
                     }
-                    Err(error) => backend.set_error(error),
+                    Err(error) => {
+                        let title = if error.to_ascii_lowercase().contains("cancel") {
+                            "File operation cancelled"
+                        } else {
+                            "File operation failed"
+                        };
+                        notifications::send(title, error.clone());
+                        backend.set_error(error);
+                    }
                 }
             }
         });
-        std::thread::spawn(move || callback(action(cancel)));
+        let qptr = QPointer::from(&*self);
+        let tick_callback = qmetaobject::queued_callback(move |tick: OpTick| {
+            if let Some(backend) = qptr.as_pinned() {
+                backend.borrow_mut().apply_op_tick(tick);
+            }
+        });
+        let mut last_update: Option<Instant> = None;
+        let progress: OperationProgress = Box::new(move |detail, progress| {
+            let now = Instant::now();
+            if progress < 1.0
+                && last_update
+                    .is_some_and(|last| now.duration_since(last) < Duration::from_millis(80))
+            {
+                return;
+            }
+            last_update = Some(now);
+            tick_callback(OpTick {
+                generation,
+                detail,
+                progress: progress.clamp(0.0, 1.0),
+            });
+        });
+        std::thread::spawn(move || callback(action(cancel, progress)));
     }
 
     fn compress_paths(&mut self, paths: QVariantList, format: QString, password: QString) {
@@ -2526,7 +2653,7 @@ impl Backend {
             return;
         }
         let title = format!("Compressing {} items", sources.len());
-        self.run_archive_action(title, move |cancel| {
+        self.run_archive_action(title, move |cancel, _progress| {
             let archive =
                 ops::compress_archive(&sources, &dest, &cancel, format, password.as_deref())?;
             Ok(format!("Created {}", archive.display()))
@@ -2558,7 +2685,7 @@ impl Backend {
             ));
             return;
         }
-        self.run_archive_action(format!("Extracting {name}"), move |cancel| {
+        self.run_archive_action(format!("Extracting {name}"), move |cancel, _progress| {
             let mut progress = |_: usize, _: usize, _: &str| {};
             let count = ops::extract_archive(&archive, &dest, &cancel, &mut progress)?;
             Ok(format!("Extracted {count} items to {}", dest.display()))
@@ -4374,12 +4501,7 @@ impl Backend {
         }
         // The terminal binary is a single configured name; the path is an
         // argument, never a shell string.
-        let result = Command::new(&terminal)
-            .current_dir(&directory)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        let result = terminal_command(&terminal, &directory).spawn();
         if let Err(error) = result {
             self.set_error(format!("Could not start {terminal}: {error}"));
         }
@@ -5526,6 +5648,20 @@ impl Backend {
     }
 
     fn apply_transfer_finished(&mut self, done: TransferFinished) {
+        let cancelled = done.message.to_ascii_lowercase().contains("cancel");
+        let title = if cancelled {
+            "File operation cancelled"
+        } else if done.error.is_some() {
+            "File operation failed"
+        } else {
+            "File operation complete"
+        };
+        let body = done.error.as_ref().map_or_else(
+            || done.message.clone(),
+            |error| format!("{}\n{error}", done.message),
+        );
+        notifications::send(title, body);
+
         if done.from_clipboard && !done.completed_sources.is_empty() {
             self.complete_clipboard_paths(&done.completed_sources);
         }
@@ -6060,6 +6196,18 @@ impl Backend {
                 item_word(done.pairs.len())
             ));
         }
+        let notification_body = execution_error.as_ref().map_or_else(
+            || format!("Renamed {} {}", done.pairs.len(), item_word(done.pairs.len())),
+            |error| format!("Batch rename failed: {error}"),
+        );
+        let notification_title = match execution_error.as_deref() {
+            Some(error) if error.to_ascii_lowercase().contains("cancel") => {
+                "File operation cancelled"
+            }
+            Some(_) => "File operation failed",
+            None => "File operation complete",
+        };
+        notifications::send(notification_title, notification_body);
         let renamed = done
             .pairs
             .iter()
@@ -6620,12 +6768,20 @@ impl Backend {
         self.finish_operation();
         match done.error {
             Some(error) => {
+                notifications::send(
+                    "File operation failed",
+                    format!("Could not undo {}: {error}", done.description),
+                );
                 // Keep the operation so the user can look and try again.
                 self.undo_stack.push(done.original);
                 self.sync_undo_props();
                 self.set_error(format!("Could not undo: {error}"));
             }
             None => {
+                notifications::send(
+                    "File operation complete",
+                    format!("Undid {}", done.description),
+                );
                 if let Some(redo) = done.redo {
                     self.redo_stack.push(redo);
                 }
@@ -6678,11 +6834,19 @@ impl Backend {
         self.finish_operation();
         match done.error {
             Some(error) => {
+                notifications::send(
+                    "File operation failed",
+                    format!("Could not redo {}: {error}", done.description),
+                );
                 self.redo_stack.push(done.original);
                 self.sync_undo_props();
                 self.set_error(format!("Could not redo: {error}"));
             }
             None => {
+                notifications::send(
+                    "File operation complete",
+                    format!("Redid {}", done.description),
+                );
                 if let Some(undo) = done.undo {
                     self.undo_stack.push(undo);
                     if self.undo_stack.len() > MAX_UNDO_STEPS {
@@ -7547,6 +7711,18 @@ mod tests {
         backend.rebuild_tabs_property();
         backend.sync_active(false);
         backend
+    }
+
+    #[test]
+    fn terminal_launch_uses_the_login_shell() {
+        let command = terminal_command("foot", Path::new("/tmp"));
+        let expected = login_shell().expect("the current user should have a login shell");
+        let configured = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("SHELL"))
+            .and_then(|(_, value)| value)
+            .expect("the terminal command should set SHELL");
+        assert_eq!(configured, std::ffi::OsStr::new(&expected));
     }
 
     #[test]

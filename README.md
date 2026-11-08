@@ -26,6 +26,10 @@ the status below distinguishes connected features from unfinished modules.
   assignments use device/inode identity with an absolute-path fallback
 - Quick Look for images, text, archives, first-page PDF previews, and video
   playback where the installed Qt multimedia backend supports it
+- Image conversion to every writable format supported by ImageMagick on the
+  system, including HEIC when its delegate is available; originals are kept
+- Desktop notifications for completed, failed, or canceled background file
+  operations
 - ZIP, TAR, and TAR.GZ creation; ZIP/TAR extraction and TAR.GZ, TAR.BZ2,
   TAR.XZ, and TAR.ZST extraction when the corresponding decoders are installed
 - Archive extraction constrained to a chosen folder, with traversal and
@@ -60,6 +64,8 @@ opens this same pane when needed.
 - NixOS 26.05 (or a nixpkgs 26.05-compatible system)
 - Wayland with niri recommended; any Qt-supported desktop should work
 - `xdg-open` at runtime (already present on this system)
+- ImageMagick at runtime for image conversion (provided by the flake)
+- A desktop notification service for operation notifications
 - OpenGL/Wayland libraries come from the Qt packages in the dev shell
 
 You do **not** need to install Rust, Qt, `pkg-config`, or compiler tools
